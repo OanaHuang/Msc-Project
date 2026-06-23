@@ -25,36 +25,4 @@ Datasets/MPII/Images/
 *.ckpt
 checkpoints/
 runs/
-outputs/# macOS
-.DS_Store
-
-# VS Code
-.vscode/
-*.code-workspace
-
-# Python
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
-
-# Datasets
-Datasets/
-data/
-dataset/
-MPII/
-images/
-Annotations/
-
-# Processed data
-*.npz
-*.npy
-*.mat
-
-# Model files
-*.pt
-*.pth
-*.ckpt
-checkpoints/
-runs/
 outputs/
-
