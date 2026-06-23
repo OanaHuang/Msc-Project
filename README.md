@@ -20,7 +20,7 @@ The current stage of the project focuses on building a minimal working pipeline 
 MSc-Project/
 ├── README.md
 ├── .gitignore
-├── 毕业论文/
+├── Literature/
 │   └── paper.pdf
 └── Datasets/
     └── MPII/
