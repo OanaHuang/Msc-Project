@@ -2,14 +2,15 @@
 
 from pathlib import Path
 import random
-import math
+import csv
+import json
 
 import numpy as np
 from PIL import Image
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 from torchvision import models
 
@@ -33,27 +34,49 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 BEST_MODEL_PATH = OUTPUT_DIR / "best_ResNet_Heatmap_Baseline.pth"
 LAST_MODEL_PATH = OUTPUT_DIR / "last_ResNet_Heatmap_Baseline.pth"
 
+SPLIT_JSON_PATH = OUTPUT_DIR / "video_level_split.json"
+SPLIT_CSV_PATH = OUTPUT_DIR / "video_level_split_summary.csv"
+
 IMAGE_SIZE = 224
 HEATMAP_SIZE = 56
-
 NUM_KEYPOINTS = 13
 
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 EPOCHS = 20
 LR = 1e-4
-VAL_RATIO = 0.2
-NUM_WORKERS = 0
-
-# 先用 30000，和你之前 ResNet baseline 对齐
-MAX_SAMPLES = 30000
+NUM_WORKERS = 4
 
 SIGMA = 2.0
-
 RANDOM_SEED = 42
+
+# Video-level split ratio
+TRAIN_RATIO = 0.70
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
+
+# None = use all videos
+# If you want quick debug, set for example MAX_VIDEOS = 50
+MAX_VIDEOS = None
 
 
 # ============================================================
-# 2. Device
+# 2. Reproducibility
+# ============================================================
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+set_seed(RANDOM_SEED)
+
+
+# ============================================================
+# 3. Device
 # ============================================================
 
 def get_device():
@@ -69,7 +92,7 @@ DEVICE = get_device()
 
 
 # ============================================================
-# 3. Helper Functions
+# 4. Helper Functions
 # ============================================================
 
 def safe_video_id_to_str(x):
@@ -84,7 +107,7 @@ def safe_video_id_to_str(x):
     return x
 
 
-def resolve_image_path(project_root, p):
+def resolve_image_path(p):
     p_original = str(p).strip()
     p = p_original
 
@@ -93,83 +116,165 @@ def resolve_image_path(project_root, p):
 
     candidates = [
         Path(p),
-        project_root / p,
-        project_root / "Datasets" / "Penn_Action" / p,
-        project_root / "Datasets" / "Penn_Action" / "frames" / p,
+        PROJECT_ROOT / p,
+        PROJECT_ROOT / "Datasets" / "Penn_Action" / p,
+        PROJECT_ROOT / "Datasets" / "Penn_Action" / "frames" / p,
     ]
 
     for c in candidates:
         if c.exists():
             return c
 
-    raise FileNotFoundError(f"Image not found: {p_original}")
+    raise FileNotFoundError(
+        f"Image not found.\n"
+        f"Original path: {p_original}\n"
+        f"Processed path: {p}"
+    )
 
 
-def generate_gaussian_heatmap(center_x, center_y, heatmap_size, sigma):
+def make_gaussian_heatmap(x, y, heatmap_size, sigma):
     """
-    Generate one 2D Gaussian heatmap.
-    center_x, center_y are in heatmap coordinate system.
+    x, y are coordinates on heatmap scale.
+    Return: [heatmap_size, heatmap_size]
     """
-    x = np.arange(0, heatmap_size, 1, np.float32)
-    y = np.arange(0, heatmap_size, 1, np.float32)
-    yy, xx = np.meshgrid(y, x, indexing="ij")
+    grid_y, grid_x = np.meshgrid(
+        np.arange(heatmap_size),
+        np.arange(heatmap_size),
+        indexing="ij",
+    )
 
     heatmap = np.exp(
-        -((xx - center_x) ** 2 + (yy - center_y) ** 2) / (2 * sigma ** 2)
+        -((grid_x - x) ** 2 + (grid_y - y) ** 2) / (2 * sigma ** 2)
     )
 
     return heatmap.astype(np.float32)
 
 
-def heatmaps_to_coordinates(heatmaps, image_size=224, heatmap_size=56):
+def create_video_level_split(video_ids):
     """
-    heatmaps: [K, H, W]
-    return coordinates in resized image space: [K, 2]
+    Split unique video IDs into train / val / test.
+    No video can appear in more than one split.
     """
-    num_keypoints = heatmaps.shape[0]
-    coords = np.zeros((num_keypoints, 2), dtype=np.float32)
+    unique_videos = sorted(list(set(video_ids)))
 
-    for k in range(num_keypoints):
-        hm = heatmaps[k]
-        y, x = np.unravel_index(np.argmax(hm), hm.shape)
+    rng = random.Random(RANDOM_SEED)
+    rng.shuffle(unique_videos)
 
-        coords[k, 0] = x * image_size / heatmap_size
-        coords[k, 1] = y * image_size / heatmap_size
+    if MAX_VIDEOS is not None:
+        unique_videos = unique_videos[:MAX_VIDEOS]
 
-    return coords
+    num_videos = len(unique_videos)
+
+    train_end = int(num_videos * TRAIN_RATIO)
+    val_end = train_end + int(num_videos * VAL_RATIO)
+
+    train_videos = unique_videos[:train_end]
+    val_videos = unique_videos[train_end:val_end]
+    test_videos = unique_videos[val_end:]
+
+    train_set = set(train_videos)
+    val_set = set(val_videos)
+    test_set = set(test_videos)
+
+    train_indices = [
+        i for i, vid in enumerate(video_ids)
+        if vid in train_set
+    ]
+
+    val_indices = [
+        i for i, vid in enumerate(video_ids)
+        if vid in val_set
+    ]
+
+    test_indices = [
+        i for i, vid in enumerate(video_ids)
+        if vid in test_set
+    ]
+
+    return {
+        "train_videos": train_videos,
+        "val_videos": val_videos,
+        "test_videos": test_videos,
+        "train_indices": train_indices,
+        "val_indices": val_indices,
+        "test_indices": test_indices,
+    }
+
+
+def save_split_files(split):
+    split_for_json = {
+        "random_seed": RANDOM_SEED,
+        "train_ratio": TRAIN_RATIO,
+        "val_ratio": VAL_RATIO,
+        "test_ratio": TEST_RATIO,
+        "num_train_videos": len(split["train_videos"]),
+        "num_val_videos": len(split["val_videos"]),
+        "num_test_videos": len(split["test_videos"]),
+        "num_train_frames": len(split["train_indices"]),
+        "num_val_frames": len(split["val_indices"]),
+        "num_test_frames": len(split["test_indices"]),
+        "train_videos": split["train_videos"],
+        "val_videos": split["val_videos"],
+        "test_videos": split["test_videos"],
+    }
+
+    with open(SPLIT_JSON_PATH, "w") as f:
+        json.dump(split_for_json, f, indent=4)
+
+    rows = [
+        {
+            "split": "train",
+            "num_videos": len(split["train_videos"]),
+            "num_frames": len(split["train_indices"]),
+            "video_ids": " ".join(split["train_videos"]),
+        },
+        {
+            "split": "val",
+            "num_videos": len(split["val_videos"]),
+            "num_frames": len(split["val_indices"]),
+            "video_ids": " ".join(split["val_videos"]),
+        },
+        {
+            "split": "test",
+            "num_videos": len(split["test_videos"]),
+            "num_frames": len(split["test_indices"]),
+            "video_ids": " ".join(split["test_videos"]),
+        },
+    ]
+
+    with open(SPLIT_CSV_PATH, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["split", "num_videos", "num_frames", "video_ids"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 # ============================================================
-# 4. Dataset
+# 5. Dataset
 # ============================================================
 
 class PennActionHeatmapDataset(Dataset):
     def __init__(
         self,
         npz_path,
-        project_root,
+        indices,
         image_size=224,
         heatmap_size=56,
         sigma=2.0,
-        max_samples=None,
     ):
-        super().__init__()
+        self.data = np.load(npz_path, allow_pickle=True)
 
-        data = np.load(npz_path, allow_pickle=True)
+        self.image_paths = self.data["image_paths"]
+        self.keypoints = self.data["keypoints"].astype(np.float32)
+        self.visibility = self.data["visibility"].astype(np.float32)
 
-        self.image_paths = data["image_paths"]
-        self.keypoints = data["keypoints"].astype(np.float32)
-        self.visibility = data["visibility"].astype(np.float32)
+        self.indices = list(indices)
 
-        self.project_root = project_root
         self.image_size = image_size
         self.heatmap_size = heatmap_size
         self.sigma = sigma
-
-        self.indices = list(range(len(self.image_paths)))
-
-        if max_samples is not None:
-            self.indices = self.indices[:max_samples]
 
         self.transform = T.Compose([
             T.Resize((image_size, image_size)),
@@ -183,27 +288,27 @@ class PennActionHeatmapDataset(Dataset):
     def __len__(self):
         return len(self.indices)
 
-    def __getitem__(self, i):
-        idx = self.indices[i]
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
 
-        img_path = resolve_image_path(self.project_root, self.image_paths[idx])
+        img_path = resolve_image_path(self.image_paths[real_idx])
+
         img = Image.open(img_path).convert("RGB")
-
         orig_w, orig_h = img.size
 
-        kpts = self.keypoints[idx].copy()
-        vis = self.visibility[idx].copy()
+        img_tensor = self.transform(img)
 
-        image_tensor = self.transform(img)
+        kpts = self.keypoints[real_idx].copy()
+        vis = self.visibility[real_idx].copy()
 
-        target_heatmaps = np.zeros(
+        heatmaps = np.zeros(
             (NUM_KEYPOINTS, self.heatmap_size, self.heatmap_size),
-            dtype=np.float32
+            dtype=np.float32,
         )
 
         target_weights = np.zeros(
             (NUM_KEYPOINTS, 1, 1),
-            dtype=np.float32
+            dtype=np.float32,
         )
 
         for j in range(NUM_KEYPOINTS):
@@ -218,24 +323,24 @@ class PennActionHeatmapDataset(Dataset):
             heatmap_x = x / orig_w * self.heatmap_size
             heatmap_y = y / orig_h * self.heatmap_size
 
-            target_heatmaps[j] = generate_gaussian_heatmap(
-                center_x=heatmap_x,
-                center_y=heatmap_y,
-                heatmap_size=self.heatmap_size,
-                sigma=self.sigma,
+            heatmaps[j] = make_gaussian_heatmap(
+                heatmap_x,
+                heatmap_y,
+                self.heatmap_size,
+                self.sigma,
             )
 
             target_weights[j, 0, 0] = 1.0
 
         return {
-            "image": image_tensor,
-            "heatmaps": torch.from_numpy(target_heatmaps),
-            "weights": torch.from_numpy(target_weights),
+            "image": img_tensor,
+            "heatmaps": torch.from_numpy(heatmaps),
+            "target_weights": torch.from_numpy(target_weights),
         }
 
 
 # ============================================================
-# 5. Model
+# 6. Model
 # ============================================================
 
 class ResNet18HeatmapBaseline(nn.Module):
@@ -246,7 +351,7 @@ class ResNet18HeatmapBaseline(nn.Module):
 
         # Remove avgpool and fc
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])
-        # Output: [B, 512, 7, 7] for 224x224 input
+        # input 224 -> [B, 512, 7, 7]
 
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(
@@ -279,7 +384,7 @@ class ResNet18HeatmapBaseline(nn.Module):
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
 
-            nn.Conv2d(64, num_keypoints, kernel_size=1)
+            nn.Conv2d(64, num_keypoints, kernel_size=1),
         )
         # 7 -> 14 -> 28 -> 56
 
@@ -290,79 +395,94 @@ class ResNet18HeatmapBaseline(nn.Module):
 
 
 # ============================================================
-# 6. Loss
+# 7. Loss
 # ============================================================
 
-def masked_heatmap_mse_loss(pred_heatmaps, target_heatmaps, target_weights):
+def heatmap_mse_loss(pred, target, target_weights):
     """
-    pred_heatmaps: [B, K, H, W]
-    target_heatmaps: [B, K, H, W]
+    pred: [B, K, H, W]
+    target: [B, K, H, W]
     target_weights: [B, K, 1, 1]
     """
-    loss = (pred_heatmaps - target_heatmaps) ** 2
+    loss = (pred - target) ** 2
     loss = loss * target_weights
 
     visible_count = target_weights.sum()
 
-    if visible_count.item() == 0:
+    if visible_count <= 0:
         return loss.mean()
 
     return loss.sum() / visible_count
 
 
 # ============================================================
-# 7. Train / Validate
+# 8. Train / Validate
 # ============================================================
 
-def train_one_epoch(model, loader, optimizer):
+def train_one_epoch(model, dataloader, optimizer):
     model.train()
 
     total_loss = 0.0
     total_batches = 0
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(dataloader):
         images = batch["image"].to(DEVICE)
         heatmaps = batch["heatmaps"].to(DEVICE)
-        weights = batch["weights"].to(DEVICE)
-
-        preds = model(images)
-
-        loss = masked_heatmap_mse_loss(preds, heatmaps, weights)
+        target_weights = batch["target_weights"].to(DEVICE)
 
         optimizer.zero_grad()
+
+        pred_heatmaps = model(images)
+
+        loss = heatmap_mse_loss(
+            pred_heatmaps,
+            heatmaps,
+            target_weights,
+        )
+
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
         total_batches += 1
 
+        if (batch_idx + 1) % 50 == 0:
+            print(
+                f"  Batch [{batch_idx + 1}/{len(dataloader)}] "
+                f"Loss: {loss.item():.4f}"
+            )
+
     return total_loss / max(total_batches, 1)
 
 
-@torch.no_grad()
-def validate(model, loader):
+def validate_one_epoch(model, dataloader):
     model.eval()
 
     total_loss = 0.0
     total_batches = 0
 
-    for batch in loader:
-        images = batch["image"].to(DEVICE)
-        heatmaps = batch["heatmaps"].to(DEVICE)
-        weights = batch["weights"].to(DEVICE)
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch["image"].to(DEVICE)
+            heatmaps = batch["heatmaps"].to(DEVICE)
+            target_weights = batch["target_weights"].to(DEVICE)
 
-        preds = model(images)
+            pred_heatmaps = model(images)
 
-        loss = masked_heatmap_mse_loss(preds, heatmaps, weights)
+            loss = heatmap_mse_loss(
+                pred_heatmaps,
+                heatmaps,
+                target_weights,
+            )
 
-        total_loss += loss.item()
-        total_batches += 1
+            total_loss += loss.item()
+            total_batches += 1
 
     return total_loss / max(total_batches, 1)
 
 
 # ============================================================
-# 8. Main
+# 9. Main
 # ============================================================
 
 def main():
@@ -371,31 +491,50 @@ def main():
     print(f"NPZ path: {NPZ_PATH}")
     print(f"Output dir: {OUTPUT_DIR}")
 
-    random.seed(RANDOM_SEED)
-    np.random.seed(RANDOM_SEED)
-    torch.manual_seed(RANDOM_SEED)
-
     if not NPZ_PATH.exists():
         raise FileNotFoundError(f"NPZ not found: {NPZ_PATH}")
 
-    dataset = PennActionHeatmapDataset(
-        npz_path=NPZ_PATH,
-        project_root=PROJECT_ROOT,
+    data = np.load(NPZ_PATH, allow_pickle=True)
+    video_ids = np.array([safe_video_id_to_str(v) for v in data["video_ids"]])
+
+    split = create_video_level_split(video_ids)
+    save_split_files(split)
+
+    train_videos = set(split["train_videos"])
+    val_videos = set(split["val_videos"])
+    test_videos = set(split["test_videos"])
+
+    assert len(train_videos & val_videos) == 0
+    assert len(train_videos & test_videos) == 0
+    assert len(val_videos & test_videos) == 0
+
+    print("\n========== Video-level Split ==========")
+    print(f"Train videos: {len(split['train_videos'])}")
+    print(f"Val videos: {len(split['val_videos'])}")
+    print(f"Test videos: {len(split['test_videos'])}")
+
+    print(f"Train frames: {len(split['train_indices'])}")
+    print(f"Val frames: {len(split['val_indices'])}")
+    print(f"Test frames: {len(split['test_indices'])}")
+
+    print(f"\nSplit saved to:")
+    print(SPLIT_JSON_PATH)
+    print(SPLIT_CSV_PATH)
+
+    train_dataset = PennActionHeatmapDataset(
+        NPZ_PATH,
+        indices=split["train_indices"],
         image_size=IMAGE_SIZE,
         heatmap_size=HEATMAP_SIZE,
         sigma=SIGMA,
-        max_samples=MAX_SAMPLES,
     )
 
-    print(f"Dataset size: {len(dataset)}")
-
-    val_size = int(len(dataset) * VAL_RATIO)
-    train_size = len(dataset) - val_size
-
-    train_dataset, val_dataset = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(RANDOM_SEED),
+    val_dataset = PennActionHeatmapDataset(
+        NPZ_PATH,
+        indices=split["val_indices"],
+        image_size=IMAGE_SIZE,
+        heatmap_size=HEATMAP_SIZE,
+        sigma=SIGMA,
     )
 
     train_loader = DataLoader(
@@ -403,6 +542,7 @@ def main():
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
     )
 
     val_loader = DataLoader(
@@ -410,61 +550,96 @@ def main():
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
     )
 
-    print(f"Train size: {train_size}")
-    print(f"Val size: {val_size}")
-
     model = ResNet18HeatmapBaseline(num_keypoints=NUM_KEYPOINTS)
-    model.to(DEVICE)
+    model = model.to(DEVICE)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=LR,
+    )
 
     best_val_loss = float("inf")
 
-    for epoch in range(EPOCHS):
-        train_loss = train_one_epoch(model, train_loader, optimizer)
-        val_loss = validate(model, val_loader)
+    print("\n========== Training ==========")
+
+    for epoch in range(1, EPOCHS + 1):
+        print(f"\nEpoch [{epoch}/{EPOCHS}]")
+
+        train_loss = train_one_epoch(
+            model=model,
+            dataloader=train_loader,
+            optimizer=optimizer,
+        )
+
+        val_loss = validate_one_epoch(
+            model=model,
+            dataloader=val_loader,
+        )
 
         print(
-            f"Epoch [{epoch + 1}/{EPOCHS}] "
-            f"Train Loss: {train_loss:.6f} "
+            f"Epoch [{epoch}/{EPOCHS}] "
+            f"Train Loss: {train_loss:.6f} | "
             f"Val Loss: {val_loss:.6f}"
         )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
 
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "best_val_loss": best_val_loss,
-                "image_size": IMAGE_SIZE,
-                "heatmap_size": HEATMAP_SIZE,
-                "num_keypoints": NUM_KEYPOINTS,
-                "sigma": SIGMA,
-                "method": "ResNet18 Heatmap Baseline",
-            }, BEST_MODEL_PATH)
+            torch.save(
+                {
+                    "method": "ResNet18_Heatmap_Baseline_VideoSplit",
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "image_size": IMAGE_SIZE,
+                    "heatmap_size": HEATMAP_SIZE,
+                    "num_keypoints": NUM_KEYPOINTS,
+                    "sigma": SIGMA,
+                    "split_type": "video_level",
+                    "train_videos": split["train_videos"],
+                    "val_videos": split["val_videos"],
+                    "test_videos": split["test_videos"],
+                    "train_ratio": TRAIN_RATIO,
+                    "val_ratio": VAL_RATIO,
+                    "test_ratio": TEST_RATIO,
+                    "random_seed": RANDOM_SEED,
+                },
+                BEST_MODEL_PATH,
+            )
 
-            print(f"Best model saved: {BEST_MODEL_PATH}")
+            print(f"  New best model saved to: {BEST_MODEL_PATH}")
 
-    torch.save({
-        "epoch": EPOCHS - 1,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "best_val_loss": best_val_loss,
-        "image_size": IMAGE_SIZE,
-        "heatmap_size": HEATMAP_SIZE,
-        "num_keypoints": NUM_KEYPOINTS,
-        "sigma": SIGMA,
-        "method": "ResNet18 Heatmap Baseline",
-    }, LAST_MODEL_PATH)
+    torch.save(
+        {
+            "method": "ResNet18_Heatmap_Baseline_VideoSplit",
+            "epoch": EPOCHS,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_val_loss": best_val_loss,
+            "image_size": IMAGE_SIZE,
+            "heatmap_size": HEATMAP_SIZE,
+            "num_keypoints": NUM_KEYPOINTS,
+            "sigma": SIGMA,
+            "split_type": "video_level",
+            "train_videos": split["train_videos"],
+            "val_videos": split["val_videos"],
+            "test_videos": split["test_videos"],
+            "train_ratio": TRAIN_RATIO,
+            "val_ratio": VAL_RATIO,
+            "test_ratio": TEST_RATIO,
+            "random_seed": RANDOM_SEED,
+        },
+        LAST_MODEL_PATH,
+    )
 
     print("\nTraining finished.")
-    print(f"Best Val Loss: {best_val_loss:.6f}")
-    print(f"Best model saved in:\n{BEST_MODEL_PATH}")
-    print(f"Last model saved in:\n{LAST_MODEL_PATH}")
+    print(f"Best val loss: {best_val_loss:.6f}")
+    print(f"Best model saved to: {BEST_MODEL_PATH}")
+    print(f"Last model saved to: {LAST_MODEL_PATH}")
 
 
 if __name__ == "__main__":
