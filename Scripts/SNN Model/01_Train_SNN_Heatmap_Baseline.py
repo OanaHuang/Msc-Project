@@ -45,7 +45,7 @@ SPLIT_PATH = OUTPUT_DIR / "split_video_ids.json"
 
 
 # ----------------------------
-# Data settings
+# Dataset settings
 # ----------------------------
 
 IMAGE_SIZE = 224
@@ -61,11 +61,13 @@ SEED = 42
 # Training settings
 # ----------------------------
 
-BATCH_SIZE = 12
-EPOCHS = 30
+BATCH_SIZE = 32
+EPOCHS = 2
+
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
-NUM_WORKERS = 0
+
+NUM_WORKERS = 4
 
 EARLY_STOPPING_PATIENCE = 8
 GRAD_CLIP_NORM = 1.0
@@ -75,22 +77,29 @@ GRAD_CLIP_NORM = 1.0
 # SNN settings
 # ----------------------------
 
-NUM_STEPS = 4
+NUM_STEPS = 2
 BETA = 0.90
 SPIKE_THRESHOLD = 1.0
 SURROGATE_SLOPE = 25.0
 
 
 # ----------------------------
-# Metric settings
+# Evaluation settings
 # ----------------------------
 
 PCK_THRESHOLD = 0.10
 
 
-# For a quick pipeline test:
-# MAX_SAMPLES = 300
-MAX_SAMPLES = None
+# ----------------------------
+# Quick test settings
+# ----------------------------
+
+# 当前先使用 2000 帧测试完整流程。
+# 正式训练时再改成 20000 或 None。
+MAX_SAMPLES = 2000
+
+# 每多少个 batch 打印一次进度
+PRINT_EVERY_BATCHES = 20
 
 
 JOINT_NAMES = [
@@ -122,6 +131,10 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
 
 def get_device():
     if torch.cuda.is_available():
@@ -137,14 +150,10 @@ def get_device():
 
 
 # ============================================================
-# 3. NPZ key utilities
+# 3. NPZ utilities
 # ============================================================
 
 def find_key(npz_file, possible_keys, required=True):
-    """
-    Search for the first available key in an NPZ file.
-    """
-
     available_keys = set(npz_file.files)
 
     for key in possible_keys:
@@ -169,11 +178,9 @@ def decode_string(value):
 
 
 def resolve_image_path(raw_path):
-    """
-    Resolve an image path stored in the NPZ.
-    """
-
-    path = Path(decode_string(raw_path)).expanduser()
+    path = Path(
+        decode_string(raw_path)
+    ).expanduser()
 
     possible_paths = [
         path,
@@ -218,20 +225,37 @@ def make_gaussian_heatmaps(
     """
 
     heatmaps = np.zeros(
-        (NUM_KEYPOINTS, heatmap_size, heatmap_size),
+        (
+            NUM_KEYPOINTS,
+            heatmap_size,
+            heatmap_size,
+        ),
         dtype=np.float32,
     )
 
-    coordinate_scale = heatmap_size / float(image_size)
-    radius = max(1, int(3 * sigma))
+    coordinate_scale = (
+        heatmap_size / float(image_size)
+    )
+
+    radius = max(
+        1,
+        int(3 * sigma),
+    )
 
     for joint_index in range(NUM_KEYPOINTS):
 
         if visibility[joint_index] <= 0:
             continue
 
-        x = keypoints[joint_index, 0] * coordinate_scale
-        y = keypoints[joint_index, 1] * coordinate_scale
+        x = (
+            keypoints[joint_index, 0]
+            * coordinate_scale
+        )
+
+        y = (
+            keypoints[joint_index, 1]
+            * coordinate_scale
+        )
 
         if not (
             0 <= x < heatmap_size
@@ -239,13 +263,33 @@ def make_gaussian_heatmaps(
         ):
             continue
 
-        x_min = max(0, int(x) - radius)
-        x_max = min(heatmap_size, int(x) + radius + 1)
+        x_min = max(
+            0,
+            int(x) - radius,
+        )
 
-        y_min = max(0, int(y) - radius)
-        y_max = min(heatmap_size, int(y) + radius + 1)
+        x_max = min(
+            heatmap_size,
+            int(x) + radius + 1,
+        )
 
-        yy, xx = np.mgrid[y_min:y_max, x_min:x_max]
+        y_min = max(
+            0,
+            int(y) - radius,
+        )
+
+        y_max = min(
+            heatmap_size,
+            int(y) + radius + 1,
+        )
+
+        if x_min >= x_max or y_min >= y_max:
+            continue
+
+        yy, xx = np.mgrid[
+            y_min:y_max,
+            x_min:x_max,
+        ]
 
         gaussian = np.exp(
             -(
@@ -259,7 +303,14 @@ def make_gaussian_heatmaps(
             joint_index,
             y_min:y_max,
             x_min:x_max,
-        ] = gaussian
+        ] = np.maximum(
+            heatmaps[
+                joint_index,
+                y_min:y_max,
+                x_min:x_max,
+            ],
+            gaussian,
+        )
 
     return heatmaps
 
@@ -313,6 +364,7 @@ class PennActionDataset(Dataset):
         "video_id",
         "sequence_ids",
         "seq_ids",
+        "action_ids",
     ]
 
     def __init__(
@@ -324,7 +376,10 @@ class PennActionDataset(Dataset):
         super().__init__()
 
         self.npz_path = Path(npz_path)
-        self.indices = np.asarray(indices, dtype=np.int64)
+        self.indices = np.asarray(
+            indices,
+            dtype=np.int64,
+        )
         self.augment = augment
 
         self.data = np.load(
@@ -364,7 +419,9 @@ class PennActionDataset(Dataset):
                 "The NPZ contains neither images nor image paths."
             )
 
-        keypoints = self.data[self.keypoint_key]
+        keypoints = self.data[
+            self.keypoint_key
+        ]
 
         if keypoints.ndim != 3:
             raise ValueError(
@@ -384,28 +441,47 @@ class PennActionDataset(Dataset):
     def read_image(self, sample_index):
 
         if self.image_key is not None:
+
             image = np.asarray(
-                self.data[self.image_key][sample_index]
+                self.data[
+                    self.image_key
+                ][sample_index]
             )
 
-            # Convert CHW to HWC if needed.
+            if image.ndim != 3:
+                raise ValueError(
+                    f"Image must be 3D, got {image.shape} "
+                    f"at sample {sample_index}."
+                )
+
+            # CHW -> HWC
             if (
-                image.ndim == 3
-                and image.shape[0] in [1, 3, 4]
+                image.shape[0] in [1, 3, 4]
                 and image.shape[-1] not in [1, 3, 4]
             ):
-                image = np.transpose(image, (1, 2, 0))
+                image = np.transpose(
+                    image,
+                    (1, 2, 0),
+                )
 
             if image.shape[-1] == 1:
-                image = np.repeat(image, 3, axis=-1)
+                image = np.repeat(
+                    image,
+                    3,
+                    axis=-1,
+                )
 
             if image.shape[-1] == 4:
                 image = image[:, :, :3]
 
-            return np.ascontiguousarray(image)
+            return np.ascontiguousarray(
+                image
+            )
 
         image_path = resolve_image_path(
-            self.data[self.image_path_key][sample_index]
+            self.data[
+                self.image_path_key
+            ][sample_index]
         )
 
         image_bgr = cv2.imread(
@@ -428,31 +504,48 @@ class PennActionDataset(Dataset):
     def read_pose(self, sample_index):
 
         raw_pose = np.asarray(
-            self.data[self.keypoint_key][sample_index],
+            self.data[
+                self.keypoint_key
+            ][sample_index],
             dtype=np.float32,
         )
 
-        keypoints = raw_pose[:, :2].copy()
+        keypoints = raw_pose[
+            :,
+            :2,
+        ].copy()
 
         if self.visibility_key is not None:
+
             visibility = np.asarray(
-                self.data[self.visibility_key][sample_index],
+                self.data[
+                    self.visibility_key
+                ][sample_index],
                 dtype=np.float32,
             ).reshape(-1)
 
         elif raw_pose.shape[-1] >= 3:
-            visibility = raw_pose[:, 2].copy()
+
+            visibility = raw_pose[
+                :,
+                2,
+            ].copy()
 
         else:
+
             visibility = (
                 np.isfinite(keypoints).all(axis=1)
                 & (keypoints[:, 0] >= 0)
                 & (keypoints[:, 1] >= 0)
             ).astype(np.float32)
 
-        visibility = (visibility > 0).astype(np.float32)
+        visibility = (
+            visibility > 0
+        ).astype(np.float32)
 
-        invalid = ~np.isfinite(keypoints).all(axis=1)
+        invalid = ~np.isfinite(
+            keypoints
+        ).all(axis=1)
 
         visibility[invalid] = 0
         keypoints[invalid] = 0
@@ -464,10 +557,19 @@ class PennActionDataset(Dataset):
         image,
         keypoints,
     ):
-        old_height, old_width = image.shape[:2]
+        old_height, old_width = (
+            image.shape[:2]
+        )
 
-        # Detect normalized [0,1] coordinates.
-        finite_values = keypoints[np.isfinite(keypoints)]
+        if old_height <= 0 or old_width <= 0:
+            raise ValueError(
+                f"Invalid image size: "
+                f"{old_width}x{old_height}"
+            )
+
+        finite_values = keypoints[
+            np.isfinite(keypoints)
+        ]
 
         coordinates_are_normalized = (
             finite_values.size > 0
@@ -485,8 +587,13 @@ class PennActionDataset(Dataset):
             interpolation=cv2.INTER_LINEAR,
         )
 
-        keypoints[:, 0] *= IMAGE_SIZE / float(old_width)
-        keypoints[:, 1] *= IMAGE_SIZE / float(old_height)
+        keypoints[:, 0] *= (
+            IMAGE_SIZE / float(old_width)
+        )
+
+        keypoints[:, 1] *= (
+            IMAGE_SIZE / float(old_height)
+        )
 
         return resized_image, keypoints
 
@@ -502,22 +609,25 @@ class PennActionDataset(Dataset):
         if random.random() >= 0.5:
             return image, keypoints, visibility
 
-        image = np.ascontiguousarray(image[:, ::-1])
+        image = np.ascontiguousarray(
+            image[:, ::-1]
+        )
 
         keypoints = keypoints.copy()
         visibility = visibility.copy()
 
         keypoints[:, 0] = (
-            IMAGE_SIZE - 1 - keypoints[:, 0]
+            IMAGE_SIZE - 1
+            - keypoints[:, 0]
         )
 
         left_right_pairs = [
-            (1, 2),    # shoulders
-            (3, 4),    # elbows
-            (5, 6),    # wrists
-            (7, 8),    # hips
-            (9, 10),   # knees
-            (11, 12),  # ankles
+            (1, 2),
+            (3, 4),
+            (5, 6),
+            (7, 8),
+            (9, 10),
+            (11, 12),
         ]
 
         for left_index, right_index in left_right_pairs:
@@ -539,14 +649,21 @@ class PennActionDataset(Dataset):
     @staticmethod
     def normalize_image(image):
 
-        image = image.astype(np.float32)
+        image = image.astype(
+            np.float32
+        )
 
         if image.max() > 1.5:
             image /= 255.0
 
-        image = np.transpose(image, (2, 0, 1))
+        image = np.transpose(
+            image,
+            (2, 0, 1),
+        )
 
-        image = torch.from_numpy(image).float()
+        image = torch.from_numpy(
+            image
+        ).float()
 
         mean = torch.tensor(
             [0.485, 0.456, 0.406]
@@ -556,25 +673,35 @@ class PennActionDataset(Dataset):
             [0.229, 0.224, 0.225]
         ).view(3, 1, 1)
 
-        image = (image - mean) / std
+        image = (
+            image - mean
+        ) / std
 
         return image
 
     def __getitem__(self, dataset_index):
 
         sample_index = int(
-            self.indices[dataset_index]
+            self.indices[
+                dataset_index
+            ]
         )
 
-        image = self.read_image(sample_index)
-
-        keypoints, visibility = self.read_pose(
+        image = self.read_image(
             sample_index
         )
 
-        image, keypoints = self.resize_image_and_pose(
-            image,
-            keypoints,
+        keypoints, visibility = (
+            self.read_pose(
+                sample_index
+            )
+        )
+
+        image, keypoints = (
+            self.resize_image_and_pose(
+                image,
+                keypoints,
+            )
         )
 
         image, keypoints, visibility = (
@@ -594,7 +721,9 @@ class PennActionDataset(Dataset):
 
         visibility = (
             visibility
-            * inside_image.astype(np.float32)
+            * inside_image.astype(
+                np.float32
+            )
         )
 
         heatmaps = make_gaussian_heatmaps(
@@ -603,7 +732,9 @@ class PennActionDataset(Dataset):
         )
 
         return {
-            "image": self.normalize_image(image),
+            "image": self.normalize_image(
+                image
+            ),
 
             "heatmaps": torch.from_numpy(
                 heatmaps
@@ -641,7 +772,9 @@ def load_video_ids(npz_path):
             required=True,
         )
 
-        sample_count = len(data[keypoint_key])
+        sample_count = len(
+            data[keypoint_key]
+        )
 
         video_id_key = find_key(
             data,
@@ -654,7 +787,9 @@ def load_video_ids(npz_path):
             video_ids = np.asarray(
                 [
                     decode_string(value)
-                    for value in data[video_id_key]
+                    for value in data[
+                        video_id_key
+                    ]
                 ],
                 dtype=object,
             )
@@ -671,33 +806,42 @@ def load_video_ids(npz_path):
 
             video_ids = []
 
-            for path_value in data[image_path_key]:
+            for path_value in data[
+                image_path_key
+            ]:
 
                 frame_path = Path(
-                    decode_string(path_value)
+                    decode_string(
+                        path_value
+                    )
                 )
 
                 video_ids.append(
                     frame_path.parent.name
                 )
 
-            return np.asarray(
-                video_ids,
-                dtype=object,
-            ), sample_count
+            return (
+                np.asarray(
+                    video_ids,
+                    dtype=object,
+                ),
+                sample_count,
+            )
 
     print(
         "\nWARNING:\n"
         "No video IDs were found in the NPZ.\n"
         "A sample-level split will be used.\n"
-        "This can cause frames from the same video to appear "
-        "in both training and validation sets.\n"
+        "Frames from the same video may appear in both sets.\n",
+        flush=True,
     )
 
     video_ids = np.asarray(
         [
             f"sample_{index:08d}"
-            for index in range(sample_count)
+            for index in range(
+                sample_count
+            )
         ],
         dtype=object,
     )
@@ -711,7 +855,6 @@ def make_video_level_split(
     seed,
     max_samples=None,
 ):
-
     all_indices = np.arange(
         len(video_ids),
         dtype=np.int64,
@@ -724,7 +867,9 @@ def make_video_level_split(
             len(all_indices),
         )
 
-        rng = np.random.default_rng(seed)
+        rng = np.random.default_rng(
+            seed
+        )
 
         all_indices = np.sort(
             rng.choice(
@@ -734,13 +879,20 @@ def make_video_level_split(
             )
         )
 
-        selected_video_ids = video_ids[all_indices]
+        selected_video_ids = (
+            video_ids[all_indices]
+        )
 
     else:
-        selected_video_ids = video_ids
+
+        selected_video_ids = (
+            video_ids
+        )
 
     unique_video_ids = sorted(
-        set(selected_video_ids.tolist())
+        set(
+            selected_video_ids.tolist()
+        )
     )
 
     if len(unique_video_ids) < 2:
@@ -748,12 +900,20 @@ def make_video_level_split(
             "At least two videos are required."
         )
 
-    random_generator = random.Random(seed)
-    random_generator.shuffle(unique_video_ids)
+    random_generator = random.Random(
+        seed
+    )
+
+    random_generator.shuffle(
+        unique_video_ids
+    )
 
     number_of_val_videos = max(
         1,
-        round(len(unique_video_ids) * val_ratio),
+        round(
+            len(unique_video_ids)
+            * val_ratio
+        ),
     )
 
     number_of_val_videos = min(
@@ -762,11 +922,15 @@ def make_video_level_split(
     )
 
     val_video_ids = set(
-        unique_video_ids[:number_of_val_videos]
+        unique_video_ids[
+            :number_of_val_videos
+        ]
     )
 
     train_video_ids = set(
-        unique_video_ids[number_of_val_videos:]
+        unique_video_ids[
+            number_of_val_videos:
+        ]
     )
 
     train_mask = np.asarray(
@@ -783,8 +947,23 @@ def make_video_level_split(
         ]
     )
 
-    train_indices = all_indices[train_mask]
-    val_indices = all_indices[val_mask]
+    train_indices = all_indices[
+        train_mask
+    ]
+
+    val_indices = all_indices[
+        val_mask
+    ]
+
+    if len(train_indices) == 0:
+        raise RuntimeError(
+            "Training split is empty."
+        )
+
+    if len(val_indices) == 0:
+        raise RuntimeError(
+            "Validation split is empty."
+        )
 
     return (
         train_indices,
@@ -830,8 +1009,11 @@ class SpikingConvBlock(nn.Module):
             reset_mechanism="subtract",
         )
 
-    def forward(self, x, membrane):
-
+    def forward(
+        self,
+        x,
+        membrane,
+    ):
         current = self.batch_norm(
             self.conv(x)
         )
@@ -889,12 +1071,6 @@ class SNNHeatmapPoseModel(nn.Module):
             spike_gradient,
         )
 
-        # Input:
-        # 256 x 14 x 14
-        #
-        # Output:
-        # 13 x 56 x 56
-
         self.heatmap_decoder = nn.Sequential(
 
             nn.ConvTranspose2d(
@@ -941,6 +1117,7 @@ class SNNHeatmapPoseModel(nn.Module):
                     nn.ConvTranspose2d,
                 ),
             ):
+
                 nn.init.kaiming_normal_(
                     module.weight,
                     mode="fan_out",
@@ -948,14 +1125,22 @@ class SNNHeatmapPoseModel(nn.Module):
                 )
 
                 if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+                    nn.init.zeros_(
+                        module.bias
+                    )
 
             elif isinstance(
                 module,
                 nn.BatchNorm2d,
             ):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
+
+                nn.init.ones_(
+                    module.weight
+                )
+
+                nn.init.zeros_(
+                    module.bias
+                )
 
     def forward(
         self,
@@ -963,18 +1148,32 @@ class SNNHeatmapPoseModel(nn.Module):
         return_spike_rate=False,
     ):
         """
-        The same RGB image is directly presented to the SNN
-        for NUM_STEPS simulation steps.
+        Direct encoding:
+        the same RGB frame is presented for NUM_STEPS.
         """
 
-        membrane1 = self.block1.lif.init_leaky()
-        membrane2 = self.block2.lif.init_leaky()
-        membrane3 = self.block3.lif.init_leaky()
-        membrane4 = self.block4.lif.init_leaky()
+        membrane1 = (
+            self.block1.lif.init_leaky()
+        )
+
+        membrane2 = (
+            self.block2.lif.init_leaky()
+        )
+
+        membrane3 = (
+            self.block3.lif.init_leaky()
+        )
+
+        membrane4 = (
+            self.block4.lif.init_leaky()
+        )
 
         heatmap_sum = None
 
-        total_spikes = images.new_tensor(0.0)
+        total_spikes = images.new_tensor(
+            0.0
+        )
+
         total_spike_elements = 0
 
         for _ in range(NUM_STEPS):
@@ -1007,7 +1206,8 @@ class SNNHeatmapPoseModel(nn.Module):
                 heatmap_sum = heatmaps
             else:
                 heatmap_sum = (
-                    heatmap_sum + heatmaps
+                    heatmap_sum
+                    + heatmaps
                 )
 
             if return_spike_rate:
@@ -1027,17 +1227,24 @@ class SNNHeatmapPoseModel(nn.Module):
                 )
 
         final_heatmaps = (
-            heatmap_sum / float(NUM_STEPS)
+            heatmap_sum
+            / float(NUM_STEPS)
         )
 
         if return_spike_rate:
 
             spike_rate = (
                 total_spikes
-                / max(total_spike_elements, 1)
+                / max(
+                    total_spike_elements,
+                    1,
+                )
             )
 
-            return final_heatmaps, spike_rate
+            return (
+                final_heatmaps,
+                spike_rate,
+            )
 
         return final_heatmaps
 
@@ -1051,30 +1258,22 @@ def masked_heatmap_mse(
     targets,
     visibility,
 ):
-    """
-    predictions:
-        [B, J, H, W]
-
-    targets:
-        [B, J, H, W]
-
-    visibility:
-        [B, J]
-    """
-
     joint_mask = visibility[
         :,
         :,
         None,
         None,
-    ].to(predictions.dtype)
+    ].to(
+        predictions.dtype
+    )
 
     squared_error = (
         predictions - targets
     ) ** 2
 
     masked_error = (
-        squared_error * joint_mask
+        squared_error
+        * joint_mask
     )
 
     denominator = (
@@ -1083,26 +1282,19 @@ def masked_heatmap_mse(
         * predictions.shape[-1]
     ).clamp_min(1.0)
 
-    return masked_error.sum() / denominator
+    return (
+        masked_error.sum()
+        / denominator
+    )
 
 
 # ============================================================
 # 10. Heatmap decoding
 # ============================================================
 
-def heatmaps_to_coordinates(heatmaps):
-    """
-    Convert heatmap maxima to coordinates in 224x224 space.
-
-    Args:
-        heatmaps:
-            [B, J, H, W]
-
-    Returns:
-        coordinates:
-            [B, J, 2]
-    """
-
+def heatmaps_to_coordinates(
+    heatmaps,
+):
     batch_size = heatmaps.shape[0]
     num_joints = heatmaps.shape[1]
     heatmap_height = heatmaps.shape[2]
@@ -1114,8 +1306,10 @@ def heatmaps_to_coordinates(heatmaps):
         -1,
     )
 
-    maximum_indices = flattened.argmax(
-        dim=-1
+    maximum_indices = (
+        flattened.argmax(
+            dim=-1
+        )
     )
 
     y = torch.div(
@@ -1130,11 +1324,13 @@ def heatmaps_to_coordinates(heatmaps):
     )
 
     scale_x = (
-        IMAGE_SIZE / float(heatmap_width)
+        IMAGE_SIZE
+        / float(heatmap_width)
     )
 
     scale_y = (
-        IMAGE_SIZE / float(heatmap_height)
+        IMAGE_SIZE
+        / float(heatmap_height)
     )
 
     coordinates = torch.stack(
@@ -1158,11 +1354,6 @@ def calculate_pck_counts(
     visibility,
     threshold=PCK_THRESHOLD,
 ):
-    """
-    PCK normalization:
-    diagonal of GT visible-joint bounding box.
-    """
-
     total_correct = 0
     total_visible = 0
 
@@ -1171,7 +1362,9 @@ def calculate_pck_counts(
     ):
 
         visible_mask = (
-            visibility[batch_index] > 0
+            visibility[
+                batch_index
+            ] > 0
         )
 
         if visible_mask.sum() < 2:
@@ -1189,14 +1382,19 @@ def calculate_pck_counts(
             dim=0
         ).values
 
-        body_scale = torch.linalg.vector_norm(
-            maximum_xy - minimum_xy
-        ).clamp_min(1.0)
+        body_scale = (
+            torch.linalg.vector_norm(
+                maximum_xy - minimum_xy
+            )
+            .clamp_min(1.0)
+        )
 
-        distances = torch.linalg.vector_norm(
-            predictions[batch_index]
-            - targets[batch_index],
-            dim=-1,
+        distances = (
+            torch.linalg.vector_norm(
+                predictions[batch_index]
+                - targets[batch_index],
+                dim=-1,
+            )
         )
 
         normalized_distances = (
@@ -1216,7 +1414,10 @@ def calculate_pck_counts(
             visible_mask.sum().item()
         )
 
-    return total_correct, total_visible
+    return (
+        total_correct,
+        total_visible,
+    )
 
 
 # ============================================================
@@ -1228,6 +1429,7 @@ def train_one_epoch(
     loader,
     optimizer,
     device,
+    epoch,
 ):
     model.train()
 
@@ -1237,13 +1439,42 @@ def train_one_epoch(
     total_spike_rate = 0.0
     total_batches = 0
 
-    for batch in loader:
+    epoch_start_time = (
+        time.perf_counter()
+    )
 
-        images = batch["image"].to(device)
-        target_heatmaps = batch["heatmaps"].to(device)
-        visibility = batch["visibility"].to(device)
+    for batch_index, batch in enumerate(
+        loader,
+        start=1,
+    ):
+        batch_start_time = (
+            time.perf_counter()
+        )
 
-        optimizer.zero_grad(set_to_none=True)
+        images = batch[
+            "image"
+        ].to(
+            device,
+            non_blocking=True,
+        )
+
+        target_heatmaps = batch[
+            "heatmaps"
+        ].to(
+            device,
+            non_blocking=True,
+        )
+
+        visibility = batch[
+            "visibility"
+        ].to(
+            device,
+            non_blocking=True,
+        )
+
+        optimizer.zero_grad(
+            set_to_none=True
+        )
 
         predictions, spike_rate = model(
             images,
@@ -1258,7 +1489,8 @@ def train_one_epoch(
 
         if not torch.isfinite(loss):
             raise FloatingPointError(
-                f"Non-finite loss: {loss.item()}"
+                f"Non-finite loss: "
+                f"{loss.item()}"
             )
 
         loss.backward()
@@ -1273,7 +1505,8 @@ def train_one_epoch(
         batch_size = images.shape[0]
 
         total_loss += (
-            loss.item() * batch_size
+            loss.item()
+            * batch_size
         )
 
         total_samples += batch_size
@@ -1284,16 +1517,81 @@ def train_one_epoch(
 
         total_batches += 1
 
+        should_print = (
+            batch_index
+            % PRINT_EVERY_BATCHES
+            == 0
+            or batch_index
+            == len(loader)
+        )
+
+        if should_print:
+
+            running_loss = (
+                total_loss
+                / max(
+                    total_samples,
+                    1,
+                )
+            )
+
+            elapsed_time = (
+                time.perf_counter()
+                - epoch_start_time
+            )
+
+            average_batch_time = (
+                elapsed_time
+                / batch_index
+            )
+
+            remaining_batches = (
+                len(loader)
+                - batch_index
+            )
+
+            estimated_remaining = (
+                average_batch_time
+                * remaining_batches
+            )
+
+            latest_batch_time = (
+                time.perf_counter()
+                - batch_start_time
+            )
+
+            print(
+                f"  Epoch {epoch:03d} | "
+                f"Train batch "
+                f"{batch_index:04d}/{len(loader):04d} | "
+                f"batch loss={loss.item():.6f} | "
+                f"running loss={running_loss:.6f} | "
+                f"spike={spike_rate.item():.4f} | "
+                f"batch time={latest_batch_time:.2f}s | "
+                f"ETA={estimated_remaining / 60:.1f} min",
+                flush=True,
+            )
+
     average_loss = (
-        total_loss / max(total_samples, 1)
+        total_loss
+        / max(
+            total_samples,
+            1,
+        )
     )
 
     average_spike_rate = (
         total_spike_rate
-        / max(total_batches, 1)
+        / max(
+            total_batches,
+            1,
+        )
     )
 
-    return average_loss, average_spike_rate
+    return (
+        average_loss,
+        average_spike_rate,
+    )
 
 
 # ============================================================
@@ -1305,6 +1603,7 @@ def validate(
     model,
     loader,
     device,
+    epoch,
 ):
     model.eval()
 
@@ -1317,21 +1616,42 @@ def validate(
     total_spike_rate = 0.0
     total_batches = 0
 
-    for batch in loader:
+    validation_start_time = (
+        time.perf_counter()
+    )
 
-        images = batch["image"].to(device)
+    for batch_index, batch in enumerate(
+        loader,
+        start=1,
+    ):
+
+        images = batch[
+            "image"
+        ].to(
+            device,
+            non_blocking=True,
+        )
 
         target_heatmaps = batch[
             "heatmaps"
-        ].to(device)
+        ].to(
+            device,
+            non_blocking=True,
+        )
 
         target_keypoints = batch[
             "keypoints"
-        ].to(device)
+        ].to(
+            device,
+            non_blocking=True,
+        )
 
         visibility = batch[
             "visibility"
-        ].to(device)
+        ].to(
+            device,
+            non_blocking=True,
+        )
 
         predictions, spike_rate = model(
             images,
@@ -1362,7 +1682,8 @@ def validate(
         batch_size = images.shape[0]
 
         total_loss += (
-            loss.item() * batch_size
+            loss.item()
+            * batch_size
         )
 
         total_samples += batch_size
@@ -1376,18 +1697,85 @@ def validate(
 
         total_batches += 1
 
+        should_print = (
+            batch_index
+            % PRINT_EVERY_BATCHES
+            == 0
+            or batch_index
+            == len(loader)
+        )
+
+        if should_print:
+
+            running_val_loss = (
+                total_loss
+                / max(
+                    total_samples,
+                    1,
+                )
+            )
+
+            running_pck = (
+                total_correct
+                / max(
+                    total_visible,
+                    1,
+                )
+            )
+
+            elapsed_time = (
+                time.perf_counter()
+                - validation_start_time
+            )
+
+            average_batch_time = (
+                elapsed_time
+                / batch_index
+            )
+
+            remaining_batches = (
+                len(loader)
+                - batch_index
+            )
+
+            estimated_remaining = (
+                average_batch_time
+                * remaining_batches
+            )
+
+            print(
+                f"  Epoch {epoch:03d} | "
+                f"Val batch "
+                f"{batch_index:04d}/{len(loader):04d} | "
+                f"running loss={running_val_loss:.6f} | "
+                f"PCK@{PCK_THRESHOLD:.2f}="
+                f"{running_pck * 100:.2f}% | "
+                f"ETA={estimated_remaining / 60:.1f} min",
+                flush=True,
+            )
+
     average_loss = (
-        total_loss / max(total_samples, 1)
+        total_loss
+        / max(
+            total_samples,
+            1,
+        )
     )
 
     pck = (
         total_correct
-        / max(total_visible, 1)
+        / max(
+            total_visible,
+            1,
+        )
     )
 
     average_spike_rate = (
         total_spike_rate
-        / max(total_batches, 1)
+        / max(
+            total_batches,
+            1,
+        )
     )
 
     return (
@@ -1409,7 +1797,6 @@ def save_checkpoint(
     epoch,
     best_val_loss,
 ):
-
     torch.save(
         {
             "epoch": epoch,
@@ -1430,22 +1817,42 @@ def save_checkpoint(
                 JOINT_NAMES,
 
             "config": {
-                "image_size": IMAGE_SIZE,
-                "heatmap_size": HEATMAP_SIZE,
-                "num_keypoints": NUM_KEYPOINTS,
-                "heatmap_sigma": HEATMAP_SIGMA,
-                "num_steps": NUM_STEPS,
-                "beta": BETA,
+                "image_size":
+                    IMAGE_SIZE,
+
+                "heatmap_size":
+                    HEATMAP_SIZE,
+
+                "num_keypoints":
+                    NUM_KEYPOINTS,
+
+                "heatmap_sigma":
+                    HEATMAP_SIGMA,
+
+                "num_steps":
+                    NUM_STEPS,
+
+                "beta":
+                    BETA,
+
                 "spike_threshold":
                     SPIKE_THRESHOLD,
+
+                "pck_threshold":
+                    PCK_THRESHOLD,
+
+                "max_samples":
+                    MAX_SAMPLES,
             },
         },
         path,
     )
 
 
-def write_history_row(path, row):
-
+def write_history_row(
+    path,
+    row,
+):
     file_exists = path.exists()
 
     with path.open(
@@ -1456,7 +1863,9 @@ def write_history_row(path, row):
 
         writer = csv.DictWriter(
             file,
-            fieldnames=list(row.keys()),
+            fieldnames=list(
+                row.keys()
+            ),
         )
 
         if not file_exists:
@@ -1475,29 +1884,37 @@ def main():
 
     device = get_device()
 
-    print("=" * 70)
+    print("=" * 72)
     print("Penn Action SNN Heatmap Baseline")
-    print("=" * 70)
-    print(f"Project root : {PROJECT_ROOT}")
-    print(f"Dataset      : {NPZ_PATH}")
-    print(f"Output       : {OUTPUT_DIR}")
-    print(f"Device       : {device}")
-    print(f"SNN steps    : {NUM_STEPS}")
-    print(f"Beta         : {BETA}")
-    print("=" * 70)
+    print("=" * 72)
+    print(f"Project root       : {PROJECT_ROOT}")
+    print(f"Dataset            : {NPZ_PATH}")
+    print(f"Output             : {OUTPUT_DIR}")
+    print(f"Device             : {device}")
+    print(f"Batch size         : {BATCH_SIZE}")
+    print(f"Epochs             : {EPOCHS}")
+    print(f"SNN steps          : {NUM_STEPS}")
+    print(f"Beta               : {BETA}")
+    print(f"Workers            : {NUM_WORKERS}")
+    print(f"Max samples        : {MAX_SAMPLES}")
+    print(f"Print every batch  : {PRINT_EVERY_BATCHES}")
+    print("=" * 72)
 
     if not NPZ_PATH.exists():
         raise FileNotFoundError(
-            f"Dataset not found:\n{NPZ_PATH}"
+            f"Dataset not found:\n"
+            f"{NPZ_PATH}"
         )
 
-    # Print NPZ structure first.
     with np.load(
         NPZ_PATH,
         allow_pickle=True,
     ) as data:
 
-        print("\nNPZ keys:")
+        print(
+            "\nNPZ keys:",
+            flush=True,
+        )
 
         for key in data.files:
 
@@ -1506,11 +1923,14 @@ def main():
             print(
                 f"  {key}: "
                 f"shape={array.shape}, "
-                f"dtype={array.dtype}"
+                f"dtype={array.dtype}",
+                flush=True,
             )
 
-    video_ids, sample_count = load_video_ids(
-        NPZ_PATH
+    video_ids, sample_count = (
+        load_video_ids(
+            NPZ_PATH
+        )
     )
 
     (
@@ -1539,6 +1959,9 @@ def main():
 
         "num_val_samples":
             len(val_indices),
+
+        "max_samples":
+            MAX_SAMPLES,
     }
 
     SPLIT_PATH.write_text(
@@ -1549,12 +1972,46 @@ def main():
         encoding="utf-8",
     )
 
-    print("\nDataset split:")
-    print(f"Total samples : {sample_count}")
-    print(f"Train samples : {len(train_indices)}")
-    print(f"Val samples   : {len(val_indices)}")
-    print(f"Train videos  : {len(train_video_ids)}")
-    print(f"Val videos    : {len(val_video_ids)}")
+    print(
+        "\nDataset split:",
+        flush=True,
+    )
+
+    print(
+        f"Original total samples : "
+        f"{sample_count}",
+        flush=True,
+    )
+
+    print(
+        f"Selected samples       : "
+        f"{len(train_indices) + len(val_indices)}",
+        flush=True,
+    )
+
+    print(
+        f"Train samples          : "
+        f"{len(train_indices)}",
+        flush=True,
+    )
+
+    print(
+        f"Val samples            : "
+        f"{len(val_indices)}",
+        flush=True,
+    )
+
+    print(
+        f"Train videos           : "
+        f"{len(train_video_ids)}",
+        flush=True,
+    )
+
+    print(
+        f"Val videos             : "
+        f"{len(val_video_ids)}",
+        flush=True,
+    )
 
     train_dataset = PennActionDataset(
         npz_path=NPZ_PATH,
@@ -1568,7 +2025,9 @@ def main():
         augment=False,
     )
 
-    pin_memory = device.type == "cuda"
+    pin_memory = (
+        device.type == "cuda"
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -1577,6 +2036,9 @@ def main():
         num_workers=NUM_WORKERS,
         pin_memory=pin_memory,
         drop_last=False,
+        persistent_workers=(
+            NUM_WORKERS > 0
+        ),
     )
 
     val_loader = DataLoader(
@@ -1586,6 +2048,21 @@ def main():
         num_workers=NUM_WORKERS,
         pin_memory=pin_memory,
         drop_last=False,
+        persistent_workers=(
+            NUM_WORKERS > 0
+        ),
+    )
+
+    print(
+        f"\nTrain batches : "
+        f"{len(train_loader)}",
+        flush=True,
+    )
+
+    print(
+        f"Val batches   : "
+        f"{len(val_loader)}",
+        flush=True,
     )
 
     model = SNNHeatmapPoseModel().to(
@@ -1603,9 +2080,22 @@ def main():
         if parameter.requires_grad
     )
 
-    print("\nModel:")
-    print(f"Total parameters     : {total_parameters:,}")
-    print(f"Trainable parameters : {trainable_parameters:,}")
+    print(
+        "\nModel:",
+        flush=True,
+    )
+
+    print(
+        f"Total parameters     : "
+        f"{total_parameters:,}",
+        flush=True,
+    )
+
+    print(
+        f"Trainable parameters : "
+        f"{trainable_parameters:,}",
+        flush=True,
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1629,20 +2119,47 @@ def main():
     best_val_loss = float("inf")
     no_improvement_epochs = 0
 
-    print("\nTraining starts...\n")
+    print(
+        "\nTraining starts...\n",
+        flush=True,
+    )
 
-    for epoch in range(1, EPOCHS + 1):
+    full_training_start = (
+        time.perf_counter()
+    )
 
-        start_time = time.perf_counter()
+    for epoch in range(
+        1,
+        EPOCHS + 1,
+    ):
 
-        (
-            train_loss,
-            train_spike_rate,
-        ) = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            device=device,
+        epoch_start = (
+            time.perf_counter()
+        )
+
+        print(
+            f"\n{'=' * 72}",
+            flush=True,
+        )
+
+        print(
+            f"Epoch {epoch}/{EPOCHS}",
+            flush=True,
+        )
+
+        print(
+            f"{'=' * 72}",
+            flush=True,
+        )
+
+        train_loss, train_spike_rate = (
+            train_one_epoch(
+                model=model,
+                loader=train_loader,
+                optimizer=optimizer,
+                device=device,
+                epoch=epoch,
+            )
         )
 
         (
@@ -1653,25 +2170,34 @@ def main():
             model=model,
             loader=val_loader,
             device=device,
+            epoch=epoch,
         )
 
-        scheduler.step(val_loss)
+        scheduler.step(
+            val_loss
+        )
 
         current_lr = (
-            optimizer.param_groups[0]["lr"]
+            optimizer
+            .param_groups[0]["lr"]
         )
 
         elapsed_seconds = (
-            time.perf_counter() - start_time
+            time.perf_counter()
+            - epoch_start
         )
 
         is_best = (
-            val_loss < best_val_loss
+            val_loss
+            < best_val_loss
         )
 
         if is_best:
 
-            best_val_loss = val_loss
+            best_val_loss = (
+                val_loss
+            )
+
             no_improvement_epochs = 0
 
             save_checkpoint(
@@ -1684,6 +2210,7 @@ def main():
             )
 
         else:
+
             no_improvement_epochs += 1
 
         save_checkpoint(
@@ -1696,9 +2223,14 @@ def main():
         )
 
         history_row = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
+            "epoch":
+                epoch,
+
+            "train_loss":
+                train_loss,
+
+            "val_loss":
+                val_loss,
 
             f"val_pck@{PCK_THRESHOLD}":
                 val_pck,
@@ -1731,33 +2263,77 @@ def main():
         )
 
         print(
+            "\nEpoch summary:",
+            flush=True,
+        )
+
+        print(
             f"Epoch {epoch:03d}/{EPOCHS:03d} | "
             f"train loss={train_loss:.6f} | "
             f"val loss={val_loss:.6f} | "
             f"PCK@{PCK_THRESHOLD:.2f}="
             f"{val_pck * 100:.2f}% | "
-            f"spike rate={val_spike_rate:.4f} | "
+            f"train spike={train_spike_rate:.4f} | "
+            f"val spike={val_spike_rate:.4f} | "
             f"lr={current_lr:.2e} | "
             f"time={elapsed_seconds:.1f}s"
-            f"{best_text}"
+            f"{best_text}",
+            flush=True,
         )
 
         if (
             no_improvement_epochs
             >= EARLY_STOPPING_PATIENCE
         ):
+
             print(
-                "\nEarly stopping: validation loss "
-                "has not improved for "
-                f"{EARLY_STOPPING_PATIENCE} epochs."
+                "\nEarly stopping: "
+                "validation loss has not improved for "
+                f"{EARLY_STOPPING_PATIENCE} epochs.",
+                flush=True,
             )
+
             break
 
-    print("\nTraining finished.")
-    print(f"Best checkpoint : {BEST_CKPT_PATH}")
-    print(f"Last checkpoint : {LAST_CKPT_PATH}")
-    print(f"History CSV     : {HISTORY_PATH}")
-    print(f"Split JSON      : {SPLIT_PATH}")
+    total_training_seconds = (
+        time.perf_counter()
+        - full_training_start
+    )
+
+    print(
+        "\nTraining finished.",
+        flush=True,
+    )
+
+    print(
+        f"Total time      : "
+        f"{total_training_seconds / 60:.2f} minutes",
+        flush=True,
+    )
+
+    print(
+        f"Best checkpoint : "
+        f"{BEST_CKPT_PATH}",
+        flush=True,
+    )
+
+    print(
+        f"Last checkpoint : "
+        f"{LAST_CKPT_PATH}",
+        flush=True,
+    )
+
+    print(
+        f"History CSV     : "
+        f"{HISTORY_PATH}",
+        flush=True,
+    )
+
+    print(
+        f"Split JSON      : "
+        f"{SPLIT_PATH}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
