@@ -27,3 +27,30 @@ checkpoints/
 runs/
 outputs/
 Datasets/Penn_Action/
+
+# ============================================================
+# NTU RGB+D raw data
+# ============================================================
+
+Datasets/NTU_RGBD/rgb_videos/
+Datasets/NTU_RGBD/skeletons/
+
+Datasets/NTU_RGBD/**/*.zip
+Datasets/NTU_RGBD/**/*.crdownload
+Datasets/NTU_RGBD/**/*.download
+Datasets/NTU_RGBD/**/*.part
+
+
+# ============================================================
+# Logs and generated media
+# ============================================================
+
+logs/
+server_outputs/
+
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.gif
+*.log
