@@ -35,7 +35,7 @@ PRED_DIR.mkdir(parents=True, exist_ok=True)
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 
 # Choose target video
-TARGET_VIDEO_ID = "0024"
+TARGET_VIDEO_ID = "0684"
 
 # Output video FPS
 FPS = 30

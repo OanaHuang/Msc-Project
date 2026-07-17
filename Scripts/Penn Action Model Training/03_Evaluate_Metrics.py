@@ -37,17 +37,17 @@ OUTPUT_DIR = (
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SUMMARY_CSV = OUTPUT_DIR / "metrics_summary.csv"
-PCK_BY_PART_CSV = OUTPUT_DIR / "metrics_pck_by_part.csv"
-PCK_BY_JOINT_CSV = OUTPUT_DIR / "metrics_pck_by_joint.csv"
+PER_JOINT_CSV = OUTPUT_DIR / "metrics_per_joint.csv"
 
 # None = evaluate all videos
-TARGET_VIDEO_IDS = None
+TARGET_VIDEO_IDS = ["0684"]
 
 # Quick test: 10 or 100
 # Final full evaluation: None
-MAX_VIDEOS = 100
+MAX_VIDEOS = None
 
-PCK_THRESHOLD = 0.2
+# PCK thresholds based on visible keypoint bounding-box scale
+PCK_THRESHOLDS = [0.05, 0.10, 0.20, 0.50]
 
 
 # ============================================================
@@ -69,16 +69,6 @@ JOINT_NAMES = [
     "Left_Ankle",
     "Right_Ankle",
 ]
-
-PART_GROUPS = {
-    "Head": [0],
-    "Sho": [1, 2],
-    "Elb": [3, 4],
-    "Wri": [5, 6],
-    "Hip": [7, 8],
-    "Knee": [9, 10],
-    "Ank": [11, 12],
-}
 
 
 # ============================================================
@@ -106,6 +96,9 @@ class ResNetWithImageNetAllKeypointRegressor(nn.Module):
         super().__init__()
 
         self.num_keypoints = num_keypoints
+
+        # The checkpoint already contains trained weights.
+        # Here weights=None is correct because we load model_state_dict below.
         self.backbone = models.resnet18(weights=None)
 
         in_features = self.backbone.fc.in_features
@@ -159,29 +152,264 @@ def resolve_image_path(p):
         if c.exists():
             return c
 
-    raise FileNotFoundError(f"Image not found: {p_original}")
+    raise FileNotFoundError(
+        f"Image not found.\n"
+        f"Original path: {p_original}\n"
+        f"Processed path: {p}\n"
+        f"Tried:\n" + "\n".join([f"  {c}" for c in candidates])
+    )
 
 
-def compute_person_scale(gt_kpts, visibility):
+def compute_visible_mask(visibility, pred, gt):
+    """
+    Evaluate only visible and valid keypoints.
+
+    visibility: [T, K]
+    pred:       [T, K, 2]
+    gt:         [T, K, 2]
+    """
     visible = visibility > 0
+    valid_pred = ~np.isnan(pred).any(axis=-1)
+    valid_gt = ~np.isnan(gt).any(axis=-1)
 
-    if visible.sum() < 2:
-        return None
+    return visible & valid_pred & valid_gt
 
-    pts = gt_kpts[visible]
 
-    width = pts[:, 0].max() - pts[:, 0].min()
-    height = pts[:, 1].max() - pts[:, 1].min()
+def euclidean_distance(pred, gt):
+    """
+    pred: [T, K, 2]
+    gt:   [T, K, 2]
 
-    scale = max(width, height)
+    return:
+        dist: [T, K]
+    """
+    return np.linalg.norm(pred - gt, axis=-1)
 
-    if scale <= 1:
-        return None
 
-    return float(scale)
+def estimate_reference_length(gt, visibility):
+    """
+    Estimate per-frame reference length for PCK.
+
+    Penn Action does not provide MPII-style head size.
+    Therefore, this script uses the visible keypoint bounding-box scale.
+
+    reference length = max(width, height) of visible GT keypoint box
+
+    return:
+        ref_lengths: [T]
+    """
+    T, K, _ = gt.shape
+    ref_lengths = np.zeros(T, dtype=np.float32)
+
+    for t in range(T):
+        visible = visibility[t] > 0
+        valid = ~np.isnan(gt[t]).any(axis=-1)
+        mask = visible & valid
+
+        if mask.sum() < 2:
+            ref_lengths[t] = np.nan
+            continue
+
+        xs = gt[t, mask, 0]
+        ys = gt[t, mask, 1]
+
+        width = xs.max() - xs.min()
+        height = ys.max() - ys.min()
+
+        scale = max(width, height)
+
+        if scale <= 1:
+            ref_lengths[t] = np.nan
+        else:
+            ref_lengths[t] = scale
+
+    return ref_lengths
+
+
+def compute_mse(pred, gt, mask):
+    """
+    MSE over visible keypoints and both x/y coordinate values.
+    """
+    error = (pred - gt) ** 2
+    error = error[mask]
+
+    if error.size == 0:
+        return np.nan
+
+    return float(error.mean())
+
+
+def compute_rmse(pred, gt, mask):
+    mse = compute_mse(pred, gt, mask)
+
+    if np.isnan(mse):
+        return np.nan
+
+    return float(np.sqrt(mse))
+
+
+def compute_mae(pred, gt, mask):
+    """
+    MAE over visible keypoints and both x/y coordinate values.
+    """
+    error = np.abs(pred - gt)
+    error = error[mask]
+
+    if error.size == 0:
+        return np.nan
+
+    return float(error.mean())
+
+
+def compute_mean_pixel_error(dist, mask):
+    """
+    Mean Euclidean keypoint distance in pixels.
+    """
+    valid_dist = dist[mask]
+
+    if valid_dist.size == 0:
+        return np.nan
+
+    return float(valid_dist.mean())
+
+
+def compute_pck_with_frame_reference(dist, mask, ref_lengths, threshold_ratio):
+    """
+    PCK using per-frame reference length.
+
+    threshold_pixels[t] = threshold_ratio * ref_lengths[t]
+    """
+    threshold_pixels = threshold_ratio * ref_lengths
+    threshold_pixels = threshold_pixels[:, None]
+
+    valid_ref = ~np.isnan(threshold_pixels)
+    final_mask = mask & valid_ref
+
+    valid_dist = dist[final_mask]
+    valid_thresholds = np.broadcast_to(threshold_pixels, dist.shape)[final_mask]
+
+    if valid_dist.size == 0:
+        return np.nan
+
+    correct = valid_dist < valid_thresholds
+
+    return float(correct.mean() * 100.0)
+
+
+def compute_temporal_accel(all_preds, all_viss):
+    """
+    Mean acceleration of predicted keypoints.
+
+    accel[t] = pred[t] - 2 * pred[t-1] + pred[t-2]
+
+    This is useful for measuring temporal jitter.
+    Lower value usually means smoother prediction.
+    """
+    total_accel = 0.0
+    total_points = 0
+
+    for preds, viss in zip(all_preds, all_viss):
+        if len(preds) < 3:
+            continue
+
+        for t in range(2, len(preds)):
+            valid = (
+                (viss[t] > 0)
+                & (viss[t - 1] > 0)
+                & (viss[t - 2] > 0)
+            )
+
+            if valid.sum() == 0:
+                continue
+
+            accel = preds[t, valid] - 2 * preds[t - 1, valid] + preds[t - 2, valid]
+            accel_norm = np.linalg.norm(accel, axis=1)
+
+            total_accel += accel_norm.sum()
+            total_points += len(accel_norm)
+
+    if total_points == 0:
+        return np.nan
+
+    return float(total_accel / total_points)
+
+
+def compute_per_joint_metrics(all_preds, all_gts, all_viss, keypoint_names, pck_threshold_ratio=0.1):
+    """
+    Compute per-joint:
+    - visible count
+    - mean pixel error
+    - median pixel error
+    - PCK@0.1
+    """
+    num_keypoints = all_preds[0].shape[1]
+
+    joint_distances = [[] for _ in range(num_keypoints)]
+    joint_correct = np.zeros(num_keypoints, dtype=np.float32)
+    joint_total = np.zeros(num_keypoints, dtype=np.float32)
+
+    for preds, gts, viss in zip(all_preds, all_gts, all_viss):
+        dist = euclidean_distance(preds, gts)
+        mask = compute_visible_mask(viss, preds, gts)
+        ref_lengths = estimate_reference_length(gts, viss)
+        thresholds = pck_threshold_ratio * ref_lengths
+
+        T, K = dist.shape
+
+        for t in range(T):
+            if np.isnan(thresholds[t]):
+                continue
+
+            for k in range(K):
+                if not mask[t, k]:
+                    continue
+
+                d = dist[t, k]
+
+                joint_distances[k].append(float(d))
+                joint_total[k] += 1
+
+                if d < thresholds[t]:
+                    joint_correct[k] += 1
+
+    results = []
+
+    for k in range(num_keypoints):
+        distances = np.array(joint_distances[k], dtype=np.float32)
+
+        if distances.size == 0:
+            mean_error = np.nan
+            median_error = np.nan
+            pck = np.nan
+            count = 0
+        else:
+            mean_error = float(distances.mean())
+            median_error = float(np.median(distances))
+            count = int(distances.size)
+
+            if joint_total[k] > 0:
+                pck = float(joint_correct[k] / joint_total[k] * 100.0)
+            else:
+                pck = np.nan
+
+        name = keypoint_names[k] if k < len(keypoint_names) else f"joint_{k}"
+
+        results.append({
+            "joint_index": k,
+            "joint_name": name,
+            "visible_count": count,
+            "mean_pixel_error": mean_error,
+            "median_pixel_error": median_error,
+            f"PCK@{pck_threshold_ratio}": pck,
+        })
+
+    return results
 
 
 def predict_video(model, transform, image_paths, keypoints, visibility, frame_indices, indices, image_size):
+    """
+    Run frame-by-frame inference for one video.
+    """
     order = np.argsort(frame_indices[indices])
     indices = indices[order]
 
@@ -200,6 +428,7 @@ def predict_video(model, transform, image_paths, keypoints, visibility, frame_in
 
             pred = model(x)[0].detach().cpu().numpy()
 
+            # Convert from resized image coordinate system back to original frame size
             pred[:, 0] *= orig_w / image_size
             pred[:, 1] *= orig_h / image_size
 
@@ -208,114 +437,6 @@ def predict_video(model, transform, image_paths, keypoints, visibility, frame_in
             viss.append(visibility[idx])
 
     return np.stack(preds), np.stack(gts), np.stack(viss)
-
-
-def update_pck_counts(preds, gts, viss, correct, total):
-    """
-    Updates correct and total count for each keypoint.
-    """
-    num_frames, num_keypoints, _ = preds.shape
-
-    for t in range(num_frames):
-        pred = preds[t]
-        gt = gts[t]
-        vis = viss[t]
-
-        scale = compute_person_scale(gt, vis)
-
-        if scale is None:
-            continue
-
-        threshold = PCK_THRESHOLD * scale
-
-        for j in range(num_keypoints):
-            if vis[j] <= 0:
-                continue
-
-            dist = np.linalg.norm(pred[j] - gt[j])
-
-            total[j] += 1
-
-            if dist < threshold:
-                correct[j] += 1
-
-
-def compute_part_pck_percent(correct, total):
-    result = {}
-
-    all_correct = 0
-    all_total = 0
-
-    for part_name, joint_ids in PART_GROUPS.items():
-        part_correct = correct[joint_ids].sum()
-        part_total = total[joint_ids].sum()
-
-        if part_total > 0:
-            result[part_name] = float(part_correct / part_total * 100.0)
-        else:
-            result[part_name] = np.nan
-
-        all_correct += part_correct
-        all_total += part_total
-
-    if all_total > 0:
-        result["Mean"] = float(all_correct / all_total * 100.0)
-    else:
-        result["Mean"] = np.nan
-
-    return result
-
-
-def compute_joint_pck_percent(correct, total):
-    result = {}
-
-    for i, name in enumerate(JOINT_NAMES):
-        if total[i] > 0:
-            result[name] = float(correct[i] / total[i] * 100.0)
-        else:
-            result[name] = np.nan
-
-    return result
-
-
-def compute_mean_pixel_error_and_accel(all_preds, all_gts, all_viss):
-    total_dist = 0.0
-    total_points = 0
-
-    total_accel = 0.0
-    total_accel_points = 0
-
-    for preds, gts, viss in zip(all_preds, all_gts, all_viss):
-        # Mean Pixel Error
-        visible = viss > 0
-        diff = preds - gts
-        dist = np.linalg.norm(diff, axis=2)
-
-        total_dist += dist[visible].sum()
-        total_points += visible.sum()
-
-        # Accel
-        if len(preds) >= 3:
-            for t in range(2, len(preds)):
-                valid = (
-                    (viss[t] > 0)
-                    & (viss[t - 1] > 0)
-                    & (viss[t - 2] > 0)
-                )
-
-                if valid.sum() == 0:
-                    continue
-
-                accel = preds[t, valid] - 2 * preds[t - 1, valid] + preds[t - 2, valid]
-                accel_norm = np.linalg.norm(accel, axis=1)
-
-                total_accel += accel_norm.sum()
-                total_accel_points += len(accel_norm)
-
-    mean_pixel_error = total_dist / total_points if total_points > 0 else np.nan
-    mean_accel = total_accel / total_accel_points if total_accel_points > 0 else np.nan
-
-    return float(mean_pixel_error), float(mean_accel)
 
 
 # ============================================================
@@ -338,8 +459,8 @@ def main():
     data = np.load(NPZ_PATH, allow_pickle=True)
 
     image_paths = data["image_paths"]
-    keypoints = data["keypoints"]
-    visibility = data["visibility"]
+    keypoints = data["keypoints"].astype(np.float32)
+    visibility = data["visibility"].astype(np.float32)
     video_ids = np.array([safe_video_id_to_str(v) for v in data["video_ids"]])
     frame_indices = data["frame_indices"]
 
@@ -382,9 +503,6 @@ def main():
         )
     ])
 
-    correct = np.zeros(num_keypoints)
-    total = np.zeros(num_keypoints)
-
     all_preds = []
     all_gts = []
     all_viss = []
@@ -410,87 +528,122 @@ def main():
             image_size=image_size,
         )
 
-        update_pck_counts(preds, gts, viss, correct, total)
-
         all_preds.append(preds)
         all_gts.append(gts)
         all_viss.append(viss)
 
-    part_pck = compute_part_pck_percent(correct, total)
-    joint_pck = compute_joint_pck_percent(correct, total)
-    mean_pixel_error, mean_accel = compute_mean_pixel_error_and_accel(all_preds, all_gts, all_viss)
+    elapsed = time.time() - start
 
-    # Save summary
+    if len(all_preds) == 0:
+        raise RuntimeError("No videos were evaluated. Please check TARGET_VIDEO_IDS and dataset paths.")
+
+    # ========================================================
+    # 7. Compute global metrics
+    # ========================================================
+
+    all_pred_array = np.concatenate(all_preds, axis=0)
+    all_gt_array = np.concatenate(all_gts, axis=0)
+    all_vis_array = np.concatenate(all_viss, axis=0)
+
+    dist = euclidean_distance(all_pred_array, all_gt_array)
+    mask = compute_visible_mask(all_vis_array, all_pred_array, all_gt_array)
+    ref_lengths = estimate_reference_length(all_gt_array, all_vis_array)
+
+    visible_count = int(mask.sum())
+    total_count = int(mask.size)
+
+    mse = compute_mse(all_pred_array, all_gt_array, mask)
+    rmse = compute_rmse(all_pred_array, all_gt_array, mask)
+    mae = compute_mae(all_pred_array, all_gt_array, mask)
+    mean_pixel_error = compute_mean_pixel_error(dist, mask)
+    mean_accel = compute_temporal_accel(all_preds, all_viss)
+
     summary = {
         "method": "ResNet18_CoordReg_ImageNet",
         "num_videos": len(selected_video_ids),
+        "num_frames": int(all_pred_array.shape[0]),
+        "num_keypoints": int(all_pred_array.shape[1]),
+        "visible_keypoints": visible_count,
+        "total_keypoints": total_count,
+        "visibility_ratio_percent": visible_count / max(total_count, 1) * 100.0,
+        "MSE": mse,
+        "RMSE": rmse,
+        "MAE": mae,
         "mean_pixel_error": mean_pixel_error,
-        "mean_pck_0.2_percent": part_pck["Mean"],
         "mean_accel": mean_accel,
+        "elapsed_time_sec": elapsed,
     }
+
+    for thr in PCK_THRESHOLDS:
+        pck_value = compute_pck_with_frame_reference(
+            dist=dist,
+            mask=mask,
+            ref_lengths=ref_lengths,
+            threshold_ratio=thr,
+        )
+        summary[f"PCK@{thr}"] = pck_value
+
+    per_joint_results = compute_per_joint_metrics(
+        all_preds=all_preds,
+        all_gts=all_gts,
+        all_viss=all_viss,
+        keypoint_names=JOINT_NAMES,
+        pck_threshold_ratio=0.2,
+    )
+
+    # ========================================================
+    # 8. Print results
+    # ========================================================
+
+    print("\n==============================")
+    print("ResNet18 ImageNet Coordinate Regression Metrics")
+    print("==============================")
+    print(f"Videos: {len(selected_video_ids)}")
+    print(f"Frames: {all_pred_array.shape[0]}")
+    print(f"Keypoints: {all_pred_array.shape[1]}")
+    print(f"Visible keypoints: {visible_count}/{total_count}")
+    print(f"Visibility ratio: {summary['visibility_ratio_percent']:.2f}%")
+    print(f"MSE: {mse:.4f}")
+    print(f"RMSE: {rmse:.4f}")
+    print(f"MAE: {mae:.4f}")
+    print(f"Mean pixel error: {mean_pixel_error:.4f}")
+    print(f"Mean accel: {mean_accel:.4f}")
+
+    for thr in PCK_THRESHOLDS:
+        value = summary[f"PCK@{thr}"]
+        print(f"PCK@{thr}: {value:.2f}%")
+
+    print("\nPer-joint results:")
+    for r in per_joint_results:
+        print(
+            f"{r['joint_index']:02d} {r['joint_name']:<15} | "
+            f"count={r['visible_count']:<5} | "
+            f"mean_error={r['mean_pixel_error']:.2f} | "
+            f"median_error={r['median_pixel_error']:.2f} | "
+            f"PCK@0.2={r['PCK@0.2']:.2f}%"
+        )
+
+    # ========================================================
+    # 9. Save CSV files
+    # ========================================================
 
     with open(SUMMARY_CSV, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(summary.keys()))
         writer.writeheader()
         writer.writerow(summary)
 
-    # Save paper-style PCK by part
-    part_row = {
-        "method": "ResNet18_CoordReg_ImageNet",
-        "num_videos": len(selected_video_ids),
-        "Head": part_pck["Head"],
-        "Sho": part_pck["Sho"],
-        "Elb": part_pck["Elb"],
-        "Wri": part_pck["Wri"],
-        "Hip": part_pck["Hip"],
-        "Knee": part_pck["Knee"],
-        "Ank": part_pck["Ank"],
-        "Mean": part_pck["Mean"],
-    }
-
-    with open(PCK_BY_PART_CSV, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(part_row.keys()))
+    with open(PER_JOINT_CSV, "w", newline="") as f:
+        fieldnames = list(per_joint_results[0].keys())
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerow(part_row)
-
-    # Save PCK by individual joint
-    joint_row = {
-        "method": "ResNet18_CoordReg_ImageNet",
-        "num_videos": len(selected_video_ids),
-    }
-    joint_row.update(joint_pck)
-
-    with open(PCK_BY_JOINT_CSV, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(joint_row.keys()))
-        writer.writeheader()
-        writer.writerow(joint_row)
-
-    elapsed = time.time() - start
+        writer.writerows(per_joint_results)
 
     print("\nEvaluation finished.")
     print(f"Elapsed time: {elapsed:.2f}s")
 
     print("\nSaved files:")
     print(f"  {SUMMARY_CSV}")
-    print(f"  {PCK_BY_PART_CSV}")
-    print(f"  {PCK_BY_JOINT_CSV}")
-
-    print("\nPaper-style PCK by part:")
-    print(
-        f"Head={part_pck['Head']:.2f}, "
-        f"Sho={part_pck['Sho']:.2f}, "
-        f"Elb={part_pck['Elb']:.2f}, "
-        f"Wri={part_pck['Wri']:.2f}, "
-        f"Hip={part_pck['Hip']:.2f}, "
-        f"Knee={part_pck['Knee']:.2f}, "
-        f"Ank={part_pck['Ank']:.2f}, "
-        f"Mean={part_pck['Mean']:.2f}"
-    )
-
-    print("\nMain summary:")
-    print(f"Mean Pixel Error: {mean_pixel_error:.2f}")
-    print(f"PCK@0.2: {part_pck['Mean']:.2f}")
-    print(f"Accel: {mean_accel:.2f}")
+    print(f"  {PER_JOINT_CSV}")
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ OUTPUT_DIR = (
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Change this video id if needed
-TARGET_VIDEO_ID = "0031"
+TARGET_VIDEO_ID = "0684"
 
 FPS = 30
 

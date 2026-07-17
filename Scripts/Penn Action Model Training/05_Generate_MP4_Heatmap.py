@@ -1,6 +1,8 @@
 # Scripts/Penn Action Model Training/05_Generate_MP4_Heatmap.py
 
 from pathlib import Path
+import json
+
 import numpy as np
 from PIL import Image
 
@@ -37,6 +39,22 @@ CKPT_PATH_LOCAL = (
     / "best_ResNet_Heatmap_Baseline.pth"
 )
 
+# video-level split json，优先找服务器 outputs，再找本地 server_outputs
+SPLIT_JSON_SERVER = (
+    PROJECT_ROOT
+    / "outputs"
+    / "PennAction_Model_Training"
+    / "04_ResNet_Heatmap_Baseline"
+    / "video_level_split.json"
+)
+
+SPLIT_JSON_LOCAL = (
+    PROJECT_ROOT
+    / "server_outputs"
+    / "04_ResNet_Heatmap_Baseline"
+    / "video_level_split.json"
+)
+
 OUTPUT_DIR = (
     PROJECT_ROOT
     / "outputs"
@@ -45,7 +63,8 @@ OUTPUT_DIR = (
 )
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-TARGET_VIDEO_ID = "0011"
+# 从 video_level_split.json 的 test_videos 里选一个
+TARGET_VIDEO_ID = "0684"
 
 FPS = 30
 
@@ -223,6 +242,45 @@ def choose_checkpoint_path():
     )
 
 
+def choose_split_json_path():
+    if SPLIT_JSON_SERVER.exists():
+        return SPLIT_JSON_SERVER
+
+    if SPLIT_JSON_LOCAL.exists():
+        return SPLIT_JSON_LOCAL
+
+    return None
+
+
+def check_video_split(video_id):
+    split_path = choose_split_json_path()
+
+    if split_path is None:
+        print("\nSplit JSON not found. Skipping split check.")
+        return
+
+    with open(split_path, "r") as f:
+        split = json.load(f)
+
+    train_videos = set(split.get("train_videos", []))
+    val_videos = set(split.get("val_videos", []))
+    test_videos = set(split.get("test_videos", []))
+
+    print(f"\nSplit JSON path: {split_path}")
+
+    if video_id in train_videos:
+        print(f"WARNING: Video {video_id} is in TRAIN set.")
+        print("This is not suitable for final unseen-video testing.")
+    elif video_id in val_videos:
+        print(f"Video {video_id} is in VAL set.")
+        print("This is okay for validation visualisation, but not final test.")
+    elif video_id in test_videos:
+        print(f"Video {video_id} is in TEST set.")
+        print("This is suitable for unseen-video testing.")
+    else:
+        print(f"Video {video_id} is not found in train/val/test split lists.")
+
+
 def heatmaps_to_coords_original(heatmaps, orig_w, orig_h):
     """
     heatmaps: [K, H, W]
@@ -337,18 +395,30 @@ def main():
     video_ids = np.array([safe_video_id_to_str(v) for v in data["video_ids"]])
     frame_indices = data["frame_indices"]
 
-    indices = np.where(video_ids == TARGET_VIDEO_ID)[0]
+    target_video_id = safe_video_id_to_str(TARGET_VIDEO_ID)
+
+    check_video_split(target_video_id)
+
+    indices = np.where(video_ids == target_video_id)[0]
 
     if len(indices) == 0:
-        raise ValueError(f"Video not found: {TARGET_VIDEO_ID}")
+        raise ValueError(f"Video not found: {target_video_id}")
 
     indices = indices[np.argsort(frame_indices[indices])]
 
-    print(f"Target video: {TARGET_VIDEO_ID}")
+    print(f"\nTarget video: {target_video_id}")
     print(f"Number of frames: {len(indices)}")
 
     print("\nLoading checkpoint...")
-    ckpt = torch.load(ckpt_path, map_location=DEVICE)
+
+    # Important for newer PyTorch versions:
+    # This checkpoint is created by our own training script and contains
+    # model_state_dict, optimizer_state_dict, split lists and numpy scalars.
+    ckpt = torch.load(
+        ckpt_path,
+        map_location=DEVICE,
+        weights_only=False,
+    )
 
     image_size = ckpt["image_size"]
     heatmap_size = ckpt["heatmap_size"]
@@ -380,7 +450,7 @@ def main():
     first_img = Image.open(first_img_path).convert("RGB")
     orig_w, orig_h = first_img.size
 
-    output_video_path = OUTPUT_DIR / f"{TARGET_VIDEO_ID}_heatmap_pose.mp4"
+    output_video_path = OUTPUT_DIR / f"{target_video_id}_heatmap_pose.mp4"
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(
@@ -416,7 +486,7 @@ def main():
             frame_rgb = np.array(pil_img)
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-            title = f"Video {TARGET_VIDEO_ID} | Frame {int(frame_indices[idx])} | Heatmap"
+            title = f"Video {target_video_id} | Frame {int(frame_indices[idx])} | Heatmap"
 
             drawn = draw_pose(
                 frame=frame_bgr,
@@ -442,11 +512,11 @@ def main():
     score_all = np.stack(score_all, axis=0)
     frame_id_all = np.array(frame_id_all)
 
-    pred_path = OUTPUT_DIR / f"{TARGET_VIDEO_ID}_heatmap_predictions.npz"
+    pred_path = OUTPUT_DIR / f"{target_video_id}_heatmap_predictions.npz"
 
     np.savez_compressed(
         pred_path,
-        video_id=TARGET_VIDEO_ID,
+        video_id=target_video_id,
         frame_indices=frame_id_all,
         pred_keypoints=pred_all,
         pred_scores=score_all,
