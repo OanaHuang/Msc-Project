@@ -362,7 +362,7 @@ class NTUFrameDataset(Dataset):
                     image.shape[1],
                     image.shape[0],
                 ),
-                include_inferred=True,
+                include_inferred=False,
             )
         ).astype(np.float32)
 
