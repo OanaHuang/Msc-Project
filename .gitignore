@@ -54,3 +54,4 @@ server_outputs/
 *.mkv
 *.gif
 *.log
+Datasets/NTU_RGBD/extracted_frames/
