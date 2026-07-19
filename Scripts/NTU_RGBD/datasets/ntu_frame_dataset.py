@@ -10,12 +10,30 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from Scripts.common.paths import (
+    NTU_RGBD_DATASET_DIR,
+)
+
 from Scripts.NTU_RGBD.core import (
     coordinate_visibility,
     extract_primary_pose_sequence,
     read_skeleton_file,
 )
 
+
+# ============================================================
+# 1. Extracted frame directory
+# ============================================================
+
+NTU_EXTRACTED_FRAMES_DIR = (
+    NTU_RGBD_DATASET_DIR
+    / "extracted_frames"
+)
+
+
+# ============================================================
+# 2. Heatmap generation
+# ============================================================
 
 def generate_gaussian_heatmaps(
     keypoints: np.ndarray,
@@ -70,13 +88,21 @@ def generate_gaussian_heatmaps(
         ):
             continue
 
-        x_min = max(center_x - radius, 0)
+        x_min = max(
+            center_x - radius,
+            0,
+        )
+
         x_max = min(
             center_x + radius + 1,
             heatmap_size,
         )
 
-        y_min = max(center_y - radius, 0)
+        y_min = max(
+            center_y - radius,
+            0,
+        )
+
         y_max = min(
             center_y + radius + 1,
             heatmap_size,
@@ -117,6 +143,10 @@ def generate_gaussian_heatmaps(
     return heatmaps
 
 
+# ============================================================
+# 3. Dataset
+# ============================================================
+
 class NTUFrameDataset(Dataset):
     def __init__(
         self,
@@ -129,9 +159,16 @@ class NTUFrameDataset(Dataset):
         single_person_only: bool = True,
         max_samples: Optional[int] = None,
         skeleton_cache_size: int = 8,
+        extracted_frames_dir: str | Path = (
+            NTU_EXTRACTED_FRAMES_DIR
+        ),
     ) -> None:
         self.metadata_csv = Path(
             metadata_csv
+        )
+
+        self.extracted_frames_dir = Path(
+            extracted_frames_dir
         )
 
         self.transform = transform
@@ -139,12 +176,22 @@ class NTUFrameDataset(Dataset):
         self.heatmap_size = heatmap_size
         self.sigma = sigma
         self.frame_stride = frame_stride
-        self.skeleton_cache_size = skeleton_cache_size
+        self.skeleton_cache_size = (
+            skeleton_cache_size
+        )
 
         if not self.metadata_csv.exists():
             raise FileNotFoundError(
                 f"Metadata CSV not found: "
                 f"{self.metadata_csv}"
+            )
+
+        if not self.extracted_frames_dir.exists():
+            raise FileNotFoundError(
+                f"Extracted frames directory "
+                f"not found: "
+                f"{self.extracted_frames_dir}\n"
+                "Run 05a_Extract_RGB_Frames.py first."
             )
 
         if frame_stride <= 0:
@@ -153,7 +200,9 @@ class NTUFrameDataset(Dataset):
             )
 
         self.samples = self._load_metadata(
-            single_person_only=single_person_only,
+            single_person_only=(
+                single_person_only
+            ),
             max_samples=max_samples,
         )
 
@@ -169,6 +218,11 @@ class NTUFrameDataset(Dataset):
             f"{len(self.frame_index)} frames"
         )
 
+        print(
+            f"Extracted frames: "
+            f"{self.extracted_frames_dir}"
+        )
+
     def _load_metadata(
         self,
         single_person_only: bool,
@@ -180,7 +234,9 @@ class NTUFrameDataset(Dataset):
             "r",
             encoding="utf-8",
         ) as handle:
-            reader = csv.DictReader(handle)
+            reader = csv.DictReader(
+                handle
+            )
 
             for row in reader:
                 if single_person_only:
@@ -198,7 +254,9 @@ class NTUFrameDataset(Dataset):
                     }:
                         continue
 
-                rows.append(row)
+                rows.append(
+                    row
+                )
 
                 if (
                     max_samples is not None
@@ -208,7 +266,8 @@ class NTUFrameDataset(Dataset):
 
         if not rows:
             raise RuntimeError(
-                "No valid samples found in metadata CSV"
+                "No valid samples found "
+                "in metadata CSV"
             )
 
         return rows
@@ -252,7 +311,9 @@ class NTUFrameDataset(Dataset):
         self,
         skeleton_path: Path,
     ) -> dict:
-        cache_key = str(skeleton_path)
+        cache_key = str(
+            skeleton_path
+        )
 
         if cache_key in self._skeleton_cache:
             value = self._skeleton_cache.pop(
@@ -289,8 +350,23 @@ class NTUFrameDataset(Dataset):
 
         return pose_sequence
 
-    def __len__(self) -> int:
-        return len(self.frame_index)
+    def _get_frame_path(
+        self,
+        sample_id: str,
+        frame_number: int,
+    ) -> Path:
+        return (
+            self.extracted_frames_dir
+            / sample_id
+            / f"frame_{frame_number:06d}.jpg"
+        )
+
+    def __len__(
+        self,
+    ) -> int:
+        return len(
+            self.frame_index
+        )
 
     def __getitem__(
         self,
@@ -304,46 +380,40 @@ class NTUFrameDataset(Dataset):
             sample_index
         ]
 
-        rgb_path = Path(
-            sample["rgb_path"]
+        sample_id = str(
+            sample["sample_id"]
         )
 
         skeleton_path = Path(
             sample["skeleton_path"]
         )
 
-        capture = cv2.VideoCapture(
-            str(rgb_path)
+        frame_path = self._get_frame_path(
+            sample_id=sample_id,
+            frame_number=frame_number,
         )
 
-        if not capture.isOpened():
-            capture.release()
+        if not frame_path.exists():
+            raise FileNotFoundError(
+                f"Extracted frame not found: "
+                f"{frame_path}"
+            )
 
+        image = cv2.imread(
+            str(frame_path),
+            cv2.IMREAD_COLOR,
+        )
+
+        if image is None:
             raise RuntimeError(
-                f"Could not open video: "
-                f"{rgb_path}"
+                f"Could not read extracted frame: "
+                f"{frame_path}"
             )
 
-        try:
-            capture.set(
-                cv2.CAP_PROP_POS_FRAMES,
-                frame_number,
+        pose_sequence = (
+            self._load_pose_sequence(
+                skeleton_path
             )
-
-            success, image = capture.read()
-
-        finally:
-            capture.release()
-
-        if not success or image is None:
-            raise RuntimeError(
-                f"Could not read frame "
-                f"{frame_number} from "
-                f"{rgb_path}"
-            )
-
-        pose_sequence = self._load_pose_sequence(
-            skeleton_path
         )
 
         keypoints = pose_sequence[
@@ -364,7 +434,9 @@ class NTUFrameDataset(Dataset):
                 ),
                 include_inferred=False,
             )
-        ).astype(np.float32)
+        ).astype(
+            np.float32
+        )
 
         if self.transform is not None:
             transformed = self.transform(
@@ -417,27 +489,41 @@ class NTUFrameDataset(Dataset):
                 torch.from_numpy(
                     np.transpose(
                         image,
-                        (2, 0, 1),
+                        (
+                            2,
+                            0,
+                            1,
+                        ),
                     )
                 )
                 .float()
                 / 255.0
             )
 
-            keypoints_tensor = torch.from_numpy(
-                keypoints
-            ).float()
+            keypoints_tensor = (
+                torch.from_numpy(
+                    keypoints
+                ).float()
+            )
 
-            visibility_tensor = torch.from_numpy(
-                visibility
-            ).float()
+            visibility_tensor = (
+                torch.from_numpy(
+                    visibility
+                ).float()
+            )
 
         heatmaps = generate_gaussian_heatmaps(
             keypoints=(
-                keypoints_tensor.numpy()
+                keypoints_tensor
+                .detach()
+                .cpu()
+                .numpy()
             ),
             visibility=(
-                visibility_tensor.numpy()
+                visibility_tensor
+                .detach()
+                .cpu()
+                .numpy()
             ),
             image_size=self.image_size,
             heatmap_size=self.heatmap_size,
@@ -455,13 +541,11 @@ class NTUFrameDataset(Dataset):
 
             "visibility": visibility_tensor,
 
-            "sample_id": sample[
-                "sample_id"
-            ],
+            "sample_id": sample_id,
 
             "frame_index": frame_number,
 
             "rgb_path": str(
-                rgb_path
+                frame_path
             ),
         }
