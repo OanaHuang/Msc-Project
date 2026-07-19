@@ -85,6 +85,12 @@ NTU_SELECTED_DIR = (
     / "selected"
 )
 
+NTU_RGBD_DATASET_DIR = (
+    PROJECT_ROOT
+    / "Datasets"
+    / "NTU_RGBD"
+
+)
 
 # ============================================================
 # 5. Dataset-specific output directories

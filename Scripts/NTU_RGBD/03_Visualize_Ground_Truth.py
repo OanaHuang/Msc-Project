@@ -63,7 +63,7 @@ OUTPUT_DIR.mkdir(
 )
 
 # None means use the first valid sample in matched_samples.csv.
-TARGET_SAMPLE_ID = "S015C001P007R001A010"
+TARGET_SAMPLE_ID = "S015C003P015R002A013"
 
 # Start and end use zero-based frame indices.
 START_FRAME = 0
@@ -372,7 +372,7 @@ def main() -> None:
                         frame.shape[1],
                         frame.shape[0],
                     ),
-                    include_inferred=True,
+                    include_inferred=False,
                 )
             )
 
