@@ -20,6 +20,9 @@ from Scripts.NTU_RGBD.core import (
     read_skeleton_file,
 )
 
+from Scripts.NTU_RGBD.datasets.person_crop import (
+    crop_and_resize_person,
+)
 
 # ============================================================
 # 1. Extracted frame directory
@@ -146,38 +149,50 @@ def generate_gaussian_heatmaps(
 # ============================================================
 # 3. Dataset
 # ============================================================
-
 class NTUFrameDataset(Dataset):
     def __init__(
         self,
-        metadata_csv: str | Path,
+        metadata_csv,
         transform=None,
-        image_size: int = 224,
-        heatmap_size: int = 56,
-        sigma: float = 2.0,
-        frame_stride: int = 5,
-        single_person_only: bool = True,
-        max_samples: Optional[int] = None,
-        skeleton_cache_size: int = 8,
-        extracted_frames_dir: str | Path = (
-            NTU_EXTRACTED_FRAMES_DIR
-        ),
-    ) -> None:
-        self.metadata_csv = Path(
-            metadata_csv
-        )
+        image_size=224,
+        heatmap_size=56,
+        sigma=2.0,
+        frame_stride=1,
+        single_person_only=True,
+        max_samples=None,
+        skeleton_cache_size=8,
+        extracted_frames_dir=None,
+        person_crop: bool = True,
+        bbox_expansion: float = 0.25,
+    ):
+        super().__init__()
 
-        self.extracted_frames_dir = Path(
-            extracted_frames_dir
-        )
-
+        self.metadata_csv = Path(metadata_csv)
         self.transform = transform
         self.image_size = image_size
         self.heatmap_size = heatmap_size
         self.sigma = sigma
         self.frame_stride = frame_stride
-        self.skeleton_cache_size = (
-            skeleton_cache_size
+        self.single_person_only = single_person_only
+        self.max_samples = max_samples
+        self.skeleton_cache_size = skeleton_cache_size
+
+        self.person_crop = person_crop
+        self.bbox_expansion = bbox_expansion
+
+        if self.bbox_expansion < 0:
+            raise ValueError(
+                "bbox_expansion must be non-negative"
+            )
+
+        if extracted_frames_dir is None:
+            extracted_frames_dir = (
+                NTU_RGBD_DATASET_DIR
+                / "extracted_frames"
+            )
+
+        self.extracted_frames_dir = Path(
+            extracted_frames_dir
         )
 
         if not self.metadata_csv.exists():
@@ -438,6 +453,35 @@ class NTUFrameDataset(Dataset):
             np.float32
         )
 
+        original_keypoints = keypoints.copy()
+        original_visibility = visibility.copy()
+
+        if self.person_crop:
+            crop_result = crop_and_resize_person(
+                image=image,
+                keypoints=keypoints,
+                visibility=visibility,
+                output_size=self.image_size,
+                expansion=self.bbox_expansion,
+                make_square=True,
+            )
+
+            image = crop_result.image
+            keypoints = crop_result.keypoints
+            visibility = crop_result.visibility
+            person_bbox = crop_result.bbox_xyxy
+
+        else:
+            person_bbox = np.array(
+                [
+                    0.0,
+                    0.0,
+                    float(image.shape[1]),
+                    float(image.shape[0]),
+                ],
+                dtype=np.float32,
+            )
+
         if self.transform is not None:
             transformed = self.transform(
                 image=image,
@@ -548,4 +592,16 @@ class NTUFrameDataset(Dataset):
             "rgb_path": str(
                 frame_path
             ),
+
+            "person_bbox": torch.from_numpy(
+                person_bbox
+            ).float(),
+
+            "original_keypoints": torch.from_numpy(
+                original_keypoints
+            ).float(),
+
+            "original_visibility": torch.from_numpy(
+                original_visibility
+            ).float(),
         }

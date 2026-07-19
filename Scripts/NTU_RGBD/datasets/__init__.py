@@ -14,3 +14,9 @@ __all__ = [
     "build_train_transform",
     "build_eval_transform",
 ]
+
+from .person_crop import (
+    PersonCropResult,
+    compute_person_bbox,
+    crop_and_resize_person,
+)
