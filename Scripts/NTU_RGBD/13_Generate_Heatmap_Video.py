@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import csv
+import re
 import sys
 import traceback
 
@@ -23,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 # ============================================================
-# 2. Imports
+# 2. Project imports
 # ============================================================
 
 from Scripts.common.paths import (
@@ -71,25 +72,24 @@ PERSON_CROP = MODEL_VERSION == "12"
 BBOX_EXPANSION = 0.25
 
 # Raw heatmap peak threshold.
-# This is not a calibrated probability.
 CONFIDENCE_THRESHOLD = 0.02
 
-# 1 means use every frame.
+# 1 = process every frame.
 FRAME_STRIDE = 1
 
-# None means use the original video's FPS.
+# None = retain the source video's effective FPS.
 OUTPUT_FPS = None
 
 DEVICE_NAME = None
 
-# Skip MP4 files that already exist.
+# Existing non-empty MP4 files are skipped.
 SKIP_EXISTING_VIDEOS = True
 
-# Saving NPZ for 344 videos uses additional disk space.
+# Keep False when generating all 344 videos to save disk space.
 SAVE_PREDICTION_NPZ = False
 
-# None = generate every test video.
-# Use 3 or 5 for a quick test.
+# None = all test videos.
+# Change to 3 for a quick test.
 MAX_TEST_VIDEOS = None
 
 
@@ -151,7 +151,47 @@ SUMMARY_CSV = (
 
 
 # ============================================================
-# 5. NTU 25-joint skeleton edges
+# 5. NTU sample ID pattern
+# ============================================================
+
+# Example:
+# S001C001P001R001A001
+#
+# The actual RGB files on the server use lowercase names such as:
+# s001c001p005r002a001_rgb.avi
+#
+# re.IGNORECASE makes both forms match.
+NTU_SAMPLE_ID_PATTERN = re.compile(
+    r"S\d{3}C\d{3}P\d{3}R\d{3}A\d{3}",
+    re.IGNORECASE,
+)
+
+
+def extract_sample_id_from_text(
+    value: str,
+) -> str | None:
+    """
+    Extract and normalise an NTU sample ID.
+
+    Examples:
+        s001c001p005r002a001_rgb.avi
+        -> S001C001P005R002A001
+
+        /path/to/S015C001P017R002A022.skeleton
+        -> S015C001P017R002A022
+    """
+    match = NTU_SAMPLE_ID_PATTERN.search(
+        str(value)
+    )
+
+    if match is None:
+        return None
+
+    return match.group(0).upper()
+
+
+# ============================================================
+# 6. NTU skeleton connections
 # ============================================================
 
 SKELETON_EDGES = [
@@ -187,7 +227,7 @@ SKELETON_EDGES = [
 
 
 # ============================================================
-# 6. Test metadata
+# 7. Test split loading
 # ============================================================
 
 def load_test_rows(
@@ -221,12 +261,31 @@ def load_test_rows(
             }:
                 continue
 
+            raw_sample_id = str(
+                row.get(
+                    "sample_id",
+                    "",
+                )
+            )
+
+            sample_id = extract_sample_id_from_text(
+                raw_sample_id
+            )
+
+            if sample_id is None:
+                print(
+                    "Skipping row with invalid "
+                    f"sample_id: {raw_sample_id}"
+                )
+                continue
+
+            row["sample_id"] = sample_id
             rows.append(row)
 
     if not rows:
         raise RuntimeError(
-            "No single-person samples were found "
-            "in the test split."
+            "No valid single-person test samples "
+            "were found."
         )
 
     if MAX_TEST_VIDEOS is not None:
@@ -236,35 +295,32 @@ def load_test_rows(
 
 
 # ============================================================
-# 7. File lookup
+# 8. File indexing
 # ============================================================
-
-def normalise_sample_id(
-    path: Path,
-) -> str:
-    name = path.stem
-
-    for suffix in (
-        "_rgb",
-        "_RGB",
-        ".rgb",
-    ):
-        if name.endswith(suffix):
-            name = name[:-len(suffix)]
-
-    return name
-
 
 def build_file_index(
     root: Path,
     allowed_suffixes: set[str],
 ) -> dict[str, Path]:
+    """
+    Build:
+        normalised NTU sample ID -> file path
+
+    Matching is independent of filename case.
+    """
     if not root.exists():
         raise FileNotFoundError(
             f"Directory not found: {root}"
         )
 
+    allowed_suffixes = {
+        suffix.lower()
+        for suffix in allowed_suffixes
+    }
+
     index: dict[str, Path] = {}
+    ignored = 0
+    duplicates = 0
 
     for path in root.rglob("*"):
         if not path.is_file():
@@ -273,12 +329,41 @@ def build_file_index(
         if path.suffix.lower() not in allowed_suffixes:
             continue
 
-        sample_id = normalise_sample_id(
-            path
+        sample_id = extract_sample_id_from_text(
+            path.name
         )
 
-        if sample_id not in index:
-            index[sample_id] = path
+        if sample_id is None:
+            # Try the full path as a fallback.
+            sample_id = extract_sample_id_from_text(
+                str(path)
+            )
+
+        if sample_id is None:
+            ignored += 1
+            continue
+
+        if sample_id in index:
+            duplicates += 1
+            continue
+
+        index[sample_id] = path
+
+    print(
+        f"  Indexed files: {len(index)}"
+    )
+
+    if ignored:
+        print(
+            f"  Ignored files without NTU ID: "
+            f"{ignored}"
+        )
+
+    if duplicates:
+        print(
+            f"  Duplicate sample IDs ignored: "
+            f"{duplicates}"
+        )
 
     return index
 
@@ -288,26 +373,30 @@ def find_indexed_file(
     file_index: dict[str, Path],
     file_type: str,
 ) -> Path:
-    direct_path = file_index.get(
+    normalised_id = extract_sample_id_from_text(
         sample_id
     )
 
-    if direct_path is not None:
-        return direct_path
+    if normalised_id is None:
+        raise ValueError(
+            f"Invalid NTU sample ID: {sample_id}"
+        )
 
-    # Fallback for filenames with additional suffixes.
-    for indexed_id, path in file_index.items():
-        if indexed_id.startswith(sample_id):
-            return path
+    path = file_index.get(
+        normalised_id
+    )
+
+    if path is not None:
+        return path
 
     raise FileNotFoundError(
         f"{file_type} not found for sample: "
-        f"{sample_id}"
+        f"{normalised_id}"
     )
 
 
 # ============================================================
-# 8. Checkpoint loading
+# 9. Checkpoint loading
 # ============================================================
 
 def extract_state_dict(
@@ -391,7 +480,7 @@ def load_model(
 
 
 # ============================================================
-# 9. Heatmap decoding
+# 10. Heatmap decoding
 # ============================================================
 
 def decode_heatmaps(
@@ -403,8 +492,8 @@ def decode_heatmaps(
         heatmaps: [1, J, H, W]
 
     Returns:
-        keypoints: [J, 2] in model-input coordinates
-        confidence: [J]
+        keypoints: [J, 2], model-input coordinates
+        confidence: [J], raw heatmap peaks
     """
     if heatmaps.ndim != 4:
         raise ValueError(
@@ -447,7 +536,7 @@ def decode_heatmaps(
             heatmap.shape,
         )
 
-        confidence[joint_index] = (
+        confidence[joint_index] = float(
             heatmap[y, x]
         )
 
@@ -463,7 +552,7 @@ def decode_heatmaps(
 
 
 # ============================================================
-# 10. Coordinate conversion
+# 11. Coordinate conversion
 # ============================================================
 
 def map_crop_keypoints_to_original(
@@ -528,7 +617,7 @@ def map_resized_keypoints_to_original(
 
 
 # ============================================================
-# 11. Drawing
+# 12. Drawing
 # ============================================================
 
 def point_is_valid(
@@ -577,17 +666,17 @@ def draw_skeleton(
         point_a = keypoints[joint_a]
         point_b = keypoints[joint_b]
 
-        if not (
-            point_is_valid(
-                point_a,
-                image_width,
-                image_height,
-            )
-            and point_is_valid(
-                point_b,
-                image_width,
-                image_height,
-            )
+        if not point_is_valid(
+            point_a,
+            image_width,
+            image_height,
+        ):
+            continue
+
+        if not point_is_valid(
+            point_b,
+            image_width,
+            image_height,
         ):
             continue
 
@@ -684,7 +773,7 @@ def draw_legend(
         0,
     )
 
-    # Ground Truth.
+    # GT: green.
     cv2.line(
         output,
         (25, 32),
@@ -714,7 +803,7 @@ def draw_legend(
         cv2.LINE_AA,
     )
 
-    # Prediction.
+    # Prediction: red points and yellow lines.
     cv2.line(
         output,
         (25, 64),
@@ -748,7 +837,7 @@ def draw_legend(
 
 
 # ============================================================
-# 12. Generate one sample video
+# 13. Generate one sample video
 # ============================================================
 
 def generate_sample_video(
@@ -761,7 +850,7 @@ def generate_sample_video(
 ) -> dict[str, object]:
     sample_id = str(
         row["sample_id"]
-    )
+    ).upper()
 
     output_video_path = (
         OUTPUT_DIR
@@ -909,8 +998,8 @@ def generate_sample_video(
 
                 if not writer.isOpened():
                     raise RuntimeError(
-                        "Could not create video "
-                        f"writer: {output_video_path}"
+                        "Could not create video writer: "
+                        f"{output_video_path}"
                     )
 
             gt_keypoints = pose_sequence[
@@ -1042,20 +1131,16 @@ def generate_sample_video(
                     )
                 )
 
-            # Ground Truth:
-            # green points and green lines.
+            # GT: green.
             comparison_frame = draw_skeleton(
                 image=frame,
                 keypoints=gt_keypoints,
                 visibility=gt_visibility,
                 point_color=(0, 255, 0),
                 line_color=(0, 180, 0),
-                point_radius=4,
-                line_thickness=2,
             )
 
-            # Prediction:
-            # red points and yellow lines.
+            # Prediction: red points, yellow lines.
             comparison_frame = draw_skeleton(
                 image=comparison_frame,
                 keypoints=(
@@ -1064,8 +1149,6 @@ def generate_sample_video(
                 visibility=predicted_visibility,
                 point_color=(0, 0, 255),
                 line_color=(0, 255, 255),
-                point_radius=4,
-                line_thickness=2,
             )
 
             if PERSON_CROP:
@@ -1246,7 +1329,7 @@ def generate_sample_video(
 
 
 # ============================================================
-# 13. Summary
+# 14. Summary CSV
 # ============================================================
 
 SUMMARY_FIELDS = [
@@ -1279,7 +1362,7 @@ def write_summary(
 
 
 # ============================================================
-# 14. Main
+# 15. Main
 # ============================================================
 
 def main() -> None:
@@ -1308,6 +1391,7 @@ def main() -> None:
     print(f"Output directory:    {OUTPUT_DIR}")
     print("=" * 72)
 
+    print()
     print("Building RGB video index...")
 
     rgb_video_index = build_file_index(
@@ -1320,11 +1404,7 @@ def main() -> None:
         },
     )
 
-    print(
-        f"Indexed RGB videos:  "
-        f"{len(rgb_video_index)}"
-    )
-
+    print()
     print("Building skeleton index...")
 
     skeleton_index = build_file_index(
@@ -1334,11 +1414,58 @@ def main() -> None:
         },
     )
 
-    print(
-        f"Indexed skeletons:   "
-        f"{len(skeleton_index)}"
+    # Check coverage before loading the model.
+    test_sample_ids = {
+        str(row["sample_id"]).upper()
+        for row in rows
+    }
+
+    missing_rgb = sorted(
+        test_sample_ids
+        - set(rgb_video_index.keys())
     )
 
+    missing_skeleton = sorted(
+        test_sample_ids
+        - set(skeleton_index.keys())
+    )
+
+    print()
+    print("=" * 72)
+    print("Test-set file coverage")
+    print("=" * 72)
+    print(
+        f"Test sample IDs:     "
+        f"{len(test_sample_ids)}"
+    )
+    print(
+        f"Missing RGB videos:  "
+        f"{len(missing_rgb)}"
+    )
+    print(
+        f"Missing skeletons:   "
+        f"{len(missing_skeleton)}"
+    )
+
+    if missing_rgb:
+        print(
+            "First missing RGB IDs: "
+            + ", ".join(
+                missing_rgb[:10]
+            )
+        )
+
+    if missing_skeleton:
+        print(
+            "First missing skeleton IDs: "
+            + ", ".join(
+                missing_skeleton[:10]
+            )
+        )
+
+    print("=" * 72)
+
+    print()
     print("Loading model once...")
 
     model = load_model(
@@ -1362,7 +1489,7 @@ def main() -> None:
     ):
         sample_id = str(
             row["sample_id"]
-        )
+        ).upper()
 
         print()
         print(
@@ -1436,7 +1563,7 @@ def main() -> None:
                 }
             )
 
-        # Update after every sample, so progress is not lost.
+        # Save progress after every sample.
         write_summary(
             records
         )
