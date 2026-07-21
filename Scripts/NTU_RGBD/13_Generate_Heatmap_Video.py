@@ -1,10 +1,11 @@
-# Scripts/NTU_RGBD/13_Generate_MP4_Heatmap.py
+# Scripts/NTU_RGBD/13_Generate_Heatmap_Video.py
 
 from __future__ import annotations
 
 from pathlib import Path
 import csv
 import sys
+import traceback
 
 import cv2
 import numpy as np
@@ -58,14 +59,9 @@ from Scripts.NTU_RGBD.models import (
 # 3. Configuration
 # ============================================================
 
-# Choose:
 # "06" = full-frame ResNet50
 # "12" = skeleton-guided person crop ResNet50
 MODEL_VERSION = "12"
-
-# Select one video from the test split.
-# Set to None to automatically use the first valid test video.
-SAMPLE_ID = None
 
 IMAGE_SIZE = 224
 HEATMAP_SIZE = 56
@@ -75,15 +71,26 @@ PERSON_CROP = MODEL_VERSION == "12"
 BBOX_EXPANSION = 0.25
 
 # Raw heatmap peak threshold.
+# This is not a calibrated probability.
 CONFIDENCE_THRESHOLD = 0.02
 
-# Use every frame when generating the video.
+# 1 means use every frame.
 FRAME_STRIDE = 1
 
-# Output FPS.
-OUTPUT_FPS = 30.0
+# None means use the original video's FPS.
+OUTPUT_FPS = None
 
 DEVICE_NAME = None
+
+# Skip MP4 files that already exist.
+SKIP_EXISTING_VIDEOS = True
+
+# Saving NPZ for 344 videos uses additional disk space.
+SAVE_PREDICTION_NPZ = False
+
+# None = generate every test video.
+# Use 3 or 5 for a quick test.
+MAX_TEST_VIDEOS = None
 
 
 # ============================================================
@@ -95,9 +102,14 @@ TEST_CSV = (
     / "test_split.csv"
 )
 
-EXTRACTED_FRAMES_DIR = (
+RGB_VIDEO_DIR = (
     NTU_RGBD_DATASET_DIR
-    / "extracted_frames"
+    / "rgb_videos"
+)
+
+SKELETON_DIR = (
+    NTU_RGBD_DATASET_DIR
+    / "skeletons"
 )
 
 if MODEL_VERSION == "06":
@@ -132,12 +144,16 @@ OUTPUT_DIR.mkdir(
     exist_ok=True,
 )
 
+SUMMARY_CSV = (
+    OUTPUT_DIR
+    / "generation_summary.csv"
+)
+
 
 # ============================================================
-# 5. NTU skeleton connections
+# 5. NTU 25-joint skeleton edges
 # ============================================================
 
-# Zero-based NTU RGB+D 25-joint skeleton edges.
 SKELETON_EDGES = [
     (0, 1),
     (1, 20),
@@ -171,19 +187,18 @@ SKELETON_EDGES = [
 
 
 # ============================================================
-# 6. Metadata
+# 6. Test metadata
 # ============================================================
 
-def load_test_row(
+def load_test_rows(
     csv_path: Path,
-    requested_sample_id: str | None,
-) -> dict[str, str]:
+) -> list[dict[str, str]]:
     if not csv_path.exists():
         raise FileNotFoundError(
             f"Test split not found: {csv_path}"
         )
 
-    rows = []
+    rows: list[dict[str, str]] = []
 
     with csv_path.open(
         "r",
@@ -192,14 +207,14 @@ def load_test_row(
         reader = csv.DictReader(handle)
 
         for row in reader:
-            single_person_value = str(
+            is_single_person = str(
                 row.get(
                     "is_single_person",
                     "",
                 )
             ).strip().lower()
 
-            if single_person_value not in {
+            if is_single_person not in {
                 "true",
                 "1",
                 "yes",
@@ -210,25 +225,89 @@ def load_test_row(
 
     if not rows:
         raise RuntimeError(
-            "No valid single-person samples "
-            "were found in the test split."
+            "No single-person samples were found "
+            "in the test split."
         )
 
-    if requested_sample_id is None:
-        return rows[0]
+    if MAX_TEST_VIDEOS is not None:
+        rows = rows[:MAX_TEST_VIDEOS]
 
-    for row in rows:
-        if str(row["sample_id"]) == requested_sample_id:
-            return row
+    return rows
 
-    raise ValueError(
-        f"Sample ID not found in test split: "
-        f"{requested_sample_id}"
+
+# ============================================================
+# 7. File lookup
+# ============================================================
+
+def normalise_sample_id(
+    path: Path,
+) -> str:
+    name = path.stem
+
+    for suffix in (
+        "_rgb",
+        "_RGB",
+        ".rgb",
+    ):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+
+    return name
+
+
+def build_file_index(
+    root: Path,
+    allowed_suffixes: set[str],
+) -> dict[str, Path]:
+    if not root.exists():
+        raise FileNotFoundError(
+            f"Directory not found: {root}"
+        )
+
+    index: dict[str, Path] = {}
+
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+
+        if path.suffix.lower() not in allowed_suffixes:
+            continue
+
+        sample_id = normalise_sample_id(
+            path
+        )
+
+        if sample_id not in index:
+            index[sample_id] = path
+
+    return index
+
+
+def find_indexed_file(
+    sample_id: str,
+    file_index: dict[str, Path],
+    file_type: str,
+) -> Path:
+    direct_path = file_index.get(
+        sample_id
+    )
+
+    if direct_path is not None:
+        return direct_path
+
+    # Fallback for filenames with additional suffixes.
+    for indexed_id, path in file_index.items():
+        if indexed_id.startswith(sample_id):
+            return path
+
+    raise FileNotFoundError(
+        f"{file_type} not found for sample: "
+        f"{sample_id}"
     )
 
 
 # ============================================================
-# 7. Checkpoint loading
+# 8. Checkpoint loading
 # ============================================================
 
 def extract_state_dict(
@@ -245,7 +324,7 @@ def extract_state_dict(
             if isinstance(value, dict):
                 return value
 
-        if all(
+        if checkpoint and all(
             isinstance(value, torch.Tensor)
             for value in checkpoint.values()
         ):
@@ -260,7 +339,7 @@ def extract_state_dict(
 def remove_module_prefix(
     state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    cleaned = {}
+    cleaned: dict[str, torch.Tensor] = {}
 
     for key, value in state_dict.items():
         if key.startswith("module."):
@@ -312,7 +391,7 @@ def load_model(
 
 
 # ============================================================
-# 8. Heatmap decoding
+# 9. Heatmap decoding
 # ============================================================
 
 def decode_heatmaps(
@@ -384,7 +463,7 @@ def decode_heatmaps(
 
 
 # ============================================================
-# 9. Coordinate conversion
+# 10. Coordinate conversion
 # ============================================================
 
 def map_crop_keypoints_to_original(
@@ -449,8 +528,24 @@ def map_resized_keypoints_to_original(
 
 
 # ============================================================
-# 10. Drawing
+# 11. Drawing
 # ============================================================
+
+def point_is_valid(
+    point: np.ndarray,
+    image_width: int,
+    image_height: int,
+) -> bool:
+    x = float(point[0])
+    y = float(point[1])
+
+    return (
+        np.isfinite(x)
+        and np.isfinite(y)
+        and 0 <= x < image_width
+        and 0 <= y < image_height
+    )
+
 
 def draw_skeleton(
     image: np.ndarray,
@@ -463,34 +558,51 @@ def draw_skeleton(
 ) -> np.ndarray:
     output = image.copy()
 
-    visibility = np.asarray(
+    image_height, image_width = (
+        output.shape[:2]
+    )
+
+    visibility_bool = np.asarray(
         visibility,
         dtype=bool,
     )
 
     for joint_a, joint_b in SKELETON_EDGES:
         if not (
-            visibility[joint_a]
-            and visibility[joint_b]
+            visibility_bool[joint_a]
+            and visibility_bool[joint_b]
         ):
             continue
 
-        point_a = tuple(
-            np.round(
-                keypoints[joint_a]
-            ).astype(int)
-        )
+        point_a = keypoints[joint_a]
+        point_b = keypoints[joint_b]
 
-        point_b = tuple(
-            np.round(
-                keypoints[joint_b]
-            ).astype(int)
-        )
+        if not (
+            point_is_valid(
+                point_a,
+                image_width,
+                image_height,
+            )
+            and point_is_valid(
+                point_b,
+                image_width,
+                image_height,
+            )
+        ):
+            continue
 
         cv2.line(
             output,
-            point_a,
-            point_b,
+            tuple(
+                np.round(
+                    point_a
+                ).astype(int)
+            ),
+            tuple(
+                np.round(
+                    point_b
+                ).astype(int)
+            ),
             line_color,
             line_thickness,
             cv2.LINE_AA,
@@ -499,16 +611,23 @@ def draw_skeleton(
     for joint_index, point in enumerate(
         keypoints
     ):
-        if not visibility[joint_index]:
+        if not visibility_bool[joint_index]:
             continue
 
-        center = tuple(
-            np.round(point).astype(int)
-        )
+        if not point_is_valid(
+            point,
+            image_width,
+            image_height,
+        ):
+            continue
 
         cv2.circle(
             output,
-            center,
+            tuple(
+                np.round(
+                    point
+                ).astype(int)
+            ),
             point_radius,
             point_color,
             -1,
@@ -547,13 +666,12 @@ def draw_legend(
     model_version: str,
 ) -> np.ndarray:
     output = image.copy()
-
     overlay = output.copy()
 
     cv2.rectangle(
         overlay,
         (10, 10),
-        (310, 78),
+        (340, 82),
         (0, 0, 0),
         -1,
     )
@@ -566,12 +684,12 @@ def draw_legend(
         0,
     )
 
-    # Ground Truth legend.
+    # Ground Truth.
     cv2.line(
         output,
         (25, 32),
         (55, 32),
-        (0, 200, 0),
+        (0, 180, 0),
         3,
         cv2.LINE_AA,
     )
@@ -596,11 +714,11 @@ def draw_legend(
         cv2.LINE_AA,
     )
 
-    # Prediction legend.
+    # Prediction.
     cv2.line(
         output,
-        (25, 62),
-        (55, 62),
+        (25, 64),
+        (55, 64),
         (0, 255, 255),
         3,
         cv2.LINE_AA,
@@ -608,7 +726,7 @@ def draw_legend(
 
     cv2.circle(
         output,
-        (40, 62),
+        (40, 64),
         5,
         (0, 0, 255),
         -1,
@@ -618,7 +736,7 @@ def draw_legend(
     cv2.putText(
         output,
         f"Prediction - Model {model_version}",
-        (68, 69),
+        (68, 71),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
         (0, 0, 255),
@@ -630,46 +748,20 @@ def draw_legend(
 
 
 # ============================================================
-# 11. Main
+# 12. Generate one sample video
 # ============================================================
 
-def main() -> None:
-    device = get_device(
-        preferred=DEVICE_NAME,
-        verbose=True,
-    )
-
-    row = load_test_row(
-        csv_path=TEST_CSV,
-        requested_sample_id=SAMPLE_ID,
-    )
-
+def generate_sample_video(
+    row: dict[str, str],
+    model: torch.nn.Module,
+    transform,
+    device: torch.device,
+    rgb_video_index: dict[str, Path],
+    skeleton_index: dict[str, Path],
+) -> dict[str, object]:
     sample_id = str(
         row["sample_id"]
     )
-
-    skeleton_path = Path(
-        row["skeleton_path"]
-    )
-
-    rgb_frames = int(
-        row["rgb_frames"]
-    )
-
-    skeleton_frames = int(
-        row["skeleton_frames"]
-    )
-
-    sample_frame_dir = (
-        EXTRACTED_FRAMES_DIR
-        / sample_id
-    )
-
-    if not sample_frame_dir.exists():
-        raise FileNotFoundError(
-            f"Extracted frame directory not found: "
-            f"{sample_frame_dir}"
-        )
 
     output_video_path = (
         OUTPUT_DIR
@@ -687,26 +779,38 @@ def main() -> None:
         )
     )
 
-    print()
-    print("=" * 70)
-    print("NTU RGB+D heatmap video generation")
-    print("=" * 70)
-    print(f"Model version:      {MODEL_VERSION}")
-    print(f"Model path:         {MODEL_PATH}")
-    print(f"Sample ID:          {sample_id}")
-    print(f"Skeleton path:      {skeleton_path}")
-    print(f"Frame directory:    {sample_frame_dir}")
-    print(f"Person crop:        {PERSON_CROP}")
-    print(f"BBox expansion:     {BBOX_EXPANSION}")
-    print(f"Output video:       {output_video_path}")
+    if (
+        SKIP_EXISTING_VIDEOS
+        and output_video_path.exists()
+        and output_video_path.stat().st_size > 0
+    ):
+        return {
+            "sample_id": sample_id,
+            "status": "skipped_existing",
+            "processed_frames": "",
+            "rgb_video": "",
+            "skeleton_file": "",
+            "output_video": str(
+                output_video_path
+            ),
+            "output_npz": (
+                str(output_npz_path)
+                if output_npz_path.exists()
+                else ""
+            ),
+            "error": "",
+        }
 
-    model = load_model(
-        model_path=MODEL_PATH,
-        device=device,
+    rgb_video_path = find_indexed_file(
+        sample_id=sample_id,
+        file_index=rgb_video_index,
+        file_type="RGB video",
     )
 
-    transform = build_eval_transform(
-        image_size=IMAGE_SIZE,
+    skeleton_path = find_indexed_file(
+        sample_id=sample_id,
+        file_index=skeleton_index,
+        file_type="Skeleton file",
     )
 
     sequence = read_skeleton_file(
@@ -723,103 +827,107 @@ def main() -> None:
         pose_sequence["color_xy"]
     )
 
-    usable_frames = min(
-        rgb_frames,
-        skeleton_frames,
-        pose_frames,
+    capture = cv2.VideoCapture(
+        str(rgb_video_path)
     )
 
-    print(f"Usable frames:      {usable_frames}")
-
-    first_frame_path = (
-        sample_frame_dir
-        / "frame_000000.jpg"
-    )
-
-    first_frame = cv2.imread(
-        str(first_frame_path),
-        cv2.IMREAD_COLOR,
-    )
-
-    if first_frame is None:
+    if not capture.isOpened():
         raise RuntimeError(
-            f"Could not read first frame: "
-            f"{first_frame_path}"
+            f"Could not open RGB video: "
+            f"{rgb_video_path}"
         )
 
-    original_height, original_width = (
-        first_frame.shape[:2]
-    )
+    writer: cv2.VideoWriter | None = None
 
-    video_width = original_width
-    video_height = original_height
-
-    fps = float(OUTPUT_FPS)
-
-    writer = cv2.VideoWriter(
-        str(output_video_path),
-        cv2.VideoWriter_fourcc(
-            *"mp4v"
-        ),
-        fps,
-        (
-            video_width,
-            video_height,
-        ),
-    )
-
-    if not writer.isOpened():
-        raise RuntimeError(
-            f"Could not create video writer: "
-            f"{output_video_path}"
-        )
-
-    saved_frame_indices = []
-    saved_predictions = []
-    saved_confidences = []
-    saved_predicted_visibility = []
-    saved_ground_truth = []
-    saved_ground_truth_visibility = []
-    saved_bboxes = []
+    saved_frame_indices: list[int] = []
+    saved_predictions: list[np.ndarray] = []
+    saved_confidences: list[np.ndarray] = []
+    saved_predicted_visibility: list[np.ndarray] = []
+    saved_ground_truth: list[np.ndarray] = []
+    saved_ground_truth_visibility: list[np.ndarray] = []
+    saved_bboxes: list[np.ndarray] = []
 
     try:
-        for frame_number in range(
-            0,
-            usable_frames,
-            FRAME_STRIDE,
+        source_fps = float(
+            capture.get(
+                cv2.CAP_PROP_FPS
+            )
+        )
+
+        if (
+            not np.isfinite(source_fps)
+            or source_fps <= 0
         ):
-            frame_path = (
-                sample_frame_dir
-                / f"frame_{frame_number:06d}.jpg"
+            source_fps = 30.0
+
+        if OUTPUT_FPS is None:
+            output_fps = (
+                source_fps / FRAME_STRIDE
+            )
+        else:
+            output_fps = float(
+                OUTPUT_FPS
             )
 
-            frame = cv2.imread(
-                str(frame_path),
-                cv2.IMREAD_COLOR,
+        frame_number = 0
+
+        while frame_number < pose_frames:
+            success, frame = capture.read()
+
+            if not success:
+                break
+
+            current_frame_number = (
+                frame_number
             )
 
-            if frame is None:
-                print(
-                    f"Skipping unreadable frame: "
-                    f"{frame_path}"
-                )
+            frame_number += 1
+
+            if (
+                current_frame_number
+                % FRAME_STRIDE
+                != 0
+            ):
                 continue
+
+            frame_height, frame_width = (
+                frame.shape[:2]
+            )
+
+            if writer is None:
+                writer = cv2.VideoWriter(
+                    str(output_video_path),
+                    cv2.VideoWriter_fourcc(
+                        *"mp4v"
+                    ),
+                    output_fps,
+                    (
+                        frame_width,
+                        frame_height,
+                    ),
+                )
+
+                if not writer.isOpened():
+                    raise RuntimeError(
+                        "Could not create video "
+                        f"writer: {output_video_path}"
+                    )
 
             gt_keypoints = pose_sequence[
                 "color_xy"
-            ][frame_number].copy()
+            ][current_frame_number].copy()
 
             tracking_state = pose_sequence[
                 "tracking_state"
-            ][frame_number].copy()
+            ][current_frame_number].copy()
 
             gt_visibility = (
                 coordinate_visibility(
                     gt_keypoints,
                     tracking_state=tracking_state,
                     image_size=(
-                        frame.shape[1],
-                        frame.shape[0],
+                        frame_width,
+                        frame_height,
                     ),
                     include_inferred=False,
                 )
@@ -868,8 +976,8 @@ def main() -> None:
                     [
                         0.0,
                         0.0,
-                        float(frame.shape[1]),
-                        float(frame.shape[0]),
+                        float(frame_width),
+                        float(frame_height),
                     ],
                     dtype=np.float32,
                 )
@@ -883,7 +991,10 @@ def main() -> None:
             image_tensor = (
                 transformed["image"]
                 .unsqueeze(0)
-                .to(device)
+                .to(
+                    device,
+                    non_blocking=True,
+                )
             )
 
             with torch.inference_mode():
@@ -891,15 +1002,17 @@ def main() -> None:
                     image_tensor
                 )
 
-            predicted_model_keypoints, confidence = (
-                decode_heatmaps(
-                    predicted_heatmaps,
-                    image_size=IMAGE_SIZE,
-                )
+            (
+                predicted_model_keypoints,
+                confidence,
+            ) = decode_heatmaps(
+                predicted_heatmaps,
+                image_size=IMAGE_SIZE,
             )
 
             predicted_visibility = (
-                confidence >= CONFIDENCE_THRESHOLD
+                confidence
+                >= CONFIDENCE_THRESHOLD
             ).astype(np.float32)
 
             if PERSON_CROP:
@@ -920,25 +1033,19 @@ def main() -> None:
                             predicted_model_keypoints
                         ),
                         original_width=(
-                            frame.shape[1]
+                            frame_width
                         ),
                         original_height=(
-                            frame.shape[0]
+                            frame_height
                         ),
                         input_size=IMAGE_SIZE,
                     )
                 )
 
-            # =================================================
-            # Draw GT and prediction on the same frame
-            # =================================================
-
-            comparison_frame = frame.copy()
-
             # Ground Truth:
             # green points and green lines.
             comparison_frame = draw_skeleton(
-                image=comparison_frame,
+                image=frame,
                 keypoints=gt_keypoints,
                 visibility=gt_visibility,
                 point_color=(0, 255, 0),
@@ -951,7 +1058,9 @@ def main() -> None:
             # red points and yellow lines.
             comparison_frame = draw_skeleton(
                 image=comparison_frame,
-                keypoints=predicted_original_keypoints,
+                keypoints=(
+                    predicted_original_keypoints
+                ),
                 visibility=predicted_visibility,
                 point_color=(0, 0, 255),
                 line_color=(0, 255, 255),
@@ -975,7 +1084,7 @@ def main() -> None:
                 f"Sample: {sample_id}",
                 (
                     20,
-                    comparison_frame.shape[0] - 50,
+                    frame_height - 50,
                 ),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -986,10 +1095,10 @@ def main() -> None:
 
             cv2.putText(
                 comparison_frame,
-                f"Frame: {frame_number}",
+                f"Frame: {current_frame_number}",
                 (
                     20,
-                    comparison_frame.shape[0] - 20,
+                    frame_height - 20,
                 ),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -1003,120 +1112,352 @@ def main() -> None:
             )
 
             saved_frame_indices.append(
-                frame_number
+                current_frame_number
             )
 
-            saved_predictions.append(
-                predicted_original_keypoints
-            )
+            if SAVE_PREDICTION_NPZ:
+                saved_predictions.append(
+                    predicted_original_keypoints
+                )
 
-            saved_confidences.append(
-                confidence
-            )
+                saved_confidences.append(
+                    confidence
+                )
 
-            saved_predicted_visibility.append(
-                predicted_visibility
-            )
+                saved_predicted_visibility.append(
+                    predicted_visibility
+                )
 
-            saved_ground_truth.append(
-                gt_keypoints
-            )
+                saved_ground_truth.append(
+                    gt_keypoints
+                )
 
-            saved_ground_truth_visibility.append(
-                gt_visibility
-            )
+                saved_ground_truth_visibility.append(
+                    gt_visibility
+                )
 
-            saved_bboxes.append(
-                person_bbox
-            )
-
-            if (
-                len(saved_frame_indices) % 50
-                == 0
-            ):
-                print(
-                    f"Processed "
-                    f"{len(saved_frame_indices)} "
-                    f"frames"
+                saved_bboxes.append(
+                    person_bbox
                 )
 
     finally:
-        writer.release()
+        capture.release()
 
-    if not saved_predictions:
+        if writer is not None:
+            writer.release()
+
+    if not saved_frame_indices:
+        if output_video_path.exists():
+            output_video_path.unlink()
+
         raise RuntimeError(
             "No frames were successfully processed."
         )
 
-    np.savez_compressed(
-        output_npz_path,
-        sample_id=np.array(
-            sample_id
+    if SAVE_PREDICTION_NPZ:
+        np.savez_compressed(
+            output_npz_path,
+
+            sample_id=np.array(
+                sample_id
+            ),
+
+            model_version=np.array(
+                MODEL_VERSION
+            ),
+
+            frame_indices=np.asarray(
+                saved_frame_indices,
+                dtype=np.int32,
+            ),
+
+            predictions=np.asarray(
+                saved_predictions,
+                dtype=np.float32,
+            ),
+
+            confidences=np.asarray(
+                saved_confidences,
+                dtype=np.float32,
+            ),
+
+            predicted_visibility=np.asarray(
+                saved_predicted_visibility,
+                dtype=np.float32,
+            ),
+
+            ground_truth=np.asarray(
+                saved_ground_truth,
+                dtype=np.float32,
+            ),
+
+            ground_truth_visibility=np.asarray(
+                saved_ground_truth_visibility,
+                dtype=np.float32,
+            ),
+
+            person_bboxes=np.asarray(
+                saved_bboxes,
+                dtype=np.float32,
+            ),
+
+            person_crop=np.array(
+                PERSON_CROP
+            ),
+
+            bbox_expansion=np.array(
+                BBOX_EXPANSION,
+                dtype=np.float32,
+            ),
+
+            image_size=np.array(
+                IMAGE_SIZE,
+                dtype=np.int32,
+            ),
+
+            heatmap_size=np.array(
+                HEATMAP_SIZE,
+                dtype=np.int32,
+            ),
+        )
+
+    return {
+        "sample_id": sample_id,
+        "status": "completed",
+        "processed_frames": len(
+            saved_frame_indices
         ),
-        model_version=np.array(
-            MODEL_VERSION
+        "rgb_video": str(
+            rgb_video_path
         ),
-        frame_indices=np.asarray(
-            saved_frame_indices,
-            dtype=np.int32,
+        "skeleton_file": str(
+            skeleton_path
         ),
-        predictions=np.asarray(
-            saved_predictions,
-            dtype=np.float32,
+        "output_video": str(
+            output_video_path
         ),
-        confidences=np.asarray(
-            saved_confidences,
-            dtype=np.float32,
+        "output_npz": (
+            str(output_npz_path)
+            if SAVE_PREDICTION_NPZ
+            else ""
         ),
-        predicted_visibility=np.asarray(
-            saved_predicted_visibility,
-            dtype=np.float32,
-        ),
-        ground_truth=np.asarray(
-            saved_ground_truth,
-            dtype=np.float32,
-        ),
-        ground_truth_visibility=np.asarray(
-            saved_ground_truth_visibility,
-            dtype=np.float32,
-        ),
-        person_bboxes=np.asarray(
-            saved_bboxes,
-            dtype=np.float32,
-        ),
-        person_crop=np.array(
-            PERSON_CROP
-        ),
-        bbox_expansion=np.array(
-            BBOX_EXPANSION,
-            dtype=np.float32,
-        ),
-        image_size=np.array(
-            IMAGE_SIZE,
-            dtype=np.int32,
-        ),
-        heatmap_size=np.array(
-            HEATMAP_SIZE,
-            dtype=np.int32,
-        ),
+        "error": "",
+    }
+
+
+# ============================================================
+# 13. Summary
+# ============================================================
+
+SUMMARY_FIELDS = [
+    "sample_id",
+    "status",
+    "processed_frames",
+    "rgb_video",
+    "skeleton_file",
+    "output_video",
+    "output_npz",
+    "error",
+]
+
+
+def write_summary(
+    records: list[dict[str, object]],
+) -> None:
+    with SUMMARY_CSV.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=SUMMARY_FIELDS,
+        )
+
+        writer.writeheader()
+        writer.writerows(records)
+
+
+# ============================================================
+# 14. Main
+# ============================================================
+
+def main() -> None:
+    device = get_device(
+        preferred=DEVICE_NAME,
+        verbose=True,
+    )
+
+    rows = load_test_rows(
+        TEST_CSV
     )
 
     print()
-    print("=" * 70)
-    print("Video generation completed")
-    print("=" * 70)
-    print(
-        f"Processed frames: "
-        f"{len(saved_frame_indices)}"
+    print("=" * 72)
+    print("NTU RGB+D batch heatmap video generation")
+    print("=" * 72)
+    print(f"Model version:       {MODEL_VERSION}")
+    print(f"Model path:          {MODEL_PATH}")
+    print(f"RGB video directory: {RGB_VIDEO_DIR}")
+    print(f"Skeleton directory:  {SKELETON_DIR}")
+    print(f"Test videos:         {len(rows)}")
+    print(f"Person crop:         {PERSON_CROP}")
+    print(f"Frame stride:        {FRAME_STRIDE}")
+    print(f"Skip existing:       {SKIP_EXISTING_VIDEOS}")
+    print(f"Save NPZ:            {SAVE_PREDICTION_NPZ}")
+    print(f"Output directory:    {OUTPUT_DIR}")
+    print("=" * 72)
+
+    print("Building RGB video index...")
+
+    rgb_video_index = build_file_index(
+        root=RGB_VIDEO_DIR,
+        allowed_suffixes={
+            ".avi",
+            ".mp4",
+            ".mov",
+            ".mkv",
+        },
     )
+
     print(
-        f"Video: "
-        f"{output_video_path}"
+        f"Indexed RGB videos:  "
+        f"{len(rgb_video_index)}"
     )
+
+    print("Building skeleton index...")
+
+    skeleton_index = build_file_index(
+        root=SKELETON_DIR,
+        allowed_suffixes={
+            ".skeleton",
+        },
+    )
+
     print(
-        f"Predictions: "
-        f"{output_npz_path}"
+        f"Indexed skeletons:   "
+        f"{len(skeleton_index)}"
     )
+
+    print("Loading model once...")
+
+    model = load_model(
+        model_path=MODEL_PATH,
+        device=device,
+    )
+
+    transform = build_eval_transform(
+        image_size=IMAGE_SIZE,
+    )
+
+    records: list[dict[str, object]] = []
+
+    completed = 0
+    skipped = 0
+    failed = 0
+
+    for row_index, row in enumerate(
+        rows,
+        start=1,
+    ):
+        sample_id = str(
+            row["sample_id"]
+        )
+
+        print()
+        print(
+            f"[{row_index}/{len(rows)}] "
+            f"{sample_id}"
+        )
+
+        try:
+            record = generate_sample_video(
+                row=row,
+                model=model,
+                transform=transform,
+                device=device,
+                rgb_video_index=(
+                    rgb_video_index
+                ),
+                skeleton_index=(
+                    skeleton_index
+                ),
+            )
+
+            status = str(
+                record["status"]
+            )
+
+            if status == "completed":
+                completed += 1
+
+                print(
+                    "  Completed: "
+                    f"{record['processed_frames']} "
+                    "frames"
+                )
+
+            elif status == "skipped_existing":
+                skipped += 1
+
+                print(
+                    "  Skipped: output MP4 "
+                    "already exists"
+                )
+
+            records.append(
+                record
+            )
+
+        except Exception as error:
+            failed += 1
+
+            error_text = (
+                f"{type(error).__name__}: "
+                f"{error}"
+            )
+
+            print(
+                f"  Failed: {error_text}"
+            )
+
+            traceback.print_exc()
+
+            records.append(
+                {
+                    "sample_id": sample_id,
+                    "status": "failed",
+                    "processed_frames": "",
+                    "rgb_video": "",
+                    "skeleton_file": "",
+                    "output_video": "",
+                    "output_npz": "",
+                    "error": error_text,
+                }
+            )
+
+        # Update after every sample, so progress is not lost.
+        write_summary(
+            records
+        )
+
+        print(
+            f"  Progress: "
+            f"completed={completed}, "
+            f"skipped={skipped}, "
+            f"failed={failed}"
+        )
+
+    print()
+    print("=" * 72)
+    print("Batch video generation finished")
+    print("=" * 72)
+    print(f"Total test videos: {len(rows)}")
+    print(f"Completed:         {completed}")
+    print(f"Skipped existing:  {skipped}")
+    print(f"Failed:            {failed}")
+    print(f"Summary CSV:       {SUMMARY_CSV}")
+    print(f"Output directory:  {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
