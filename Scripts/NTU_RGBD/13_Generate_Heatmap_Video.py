@@ -74,12 +74,13 @@ NUM_JOINTS = 25
 PERSON_CROP = MODEL_VERSION == "12"
 BBOX_EXPANSION = 0.25
 
+# Raw heatmap peak threshold.
 CONFIDENCE_THRESHOLD = 0.02
 
 # Use every frame when generating the video.
 FRAME_STRIDE = 1
 
-# Output FPS. Set None to use the original metadata FPS if available.
+# Output FPS.
 OUTPUT_FPS = 30.0
 
 DEVICE_NAME = None
@@ -110,7 +111,7 @@ elif MODEL_VERSION == "12":
         NTU_RGBD_OUTPUT_DIR
         / "12_Train_ResNet50_Heatmap_Human_Detection"
     )
-    
+
 else:
     raise ValueError(
         "MODEL_VERSION must be '06' or '12'"
@@ -129,16 +130,6 @@ OUTPUT_DIR = (
 OUTPUT_DIR.mkdir(
     parents=True,
     exist_ok=True,
-)
-
-OUTPUT_VIDEO_PATH = (
-    OUTPUT_DIR
-    / f"ntu_prediction_model_{MODEL_VERSION}.mp4"
-)
-
-OUTPUT_NPZ_PATH = (
-    OUTPUT_DIR
-    / f"ntu_predictions_model_{MODEL_VERSION}.npz"
 )
 
 
@@ -467,7 +458,8 @@ def draw_skeleton(
     visibility: np.ndarray,
     point_color: tuple[int, int, int],
     line_color: tuple[int, int, int],
-    label: str,
+    point_radius: int = 4,
+    line_thickness: int = 2,
 ) -> np.ndarray:
     output = image.copy()
 
@@ -500,7 +492,7 @@ def draw_skeleton(
             point_a,
             point_b,
             line_color,
-            2,
+            line_thickness,
             cv2.LINE_AA,
         )
 
@@ -517,22 +509,11 @@ def draw_skeleton(
         cv2.circle(
             output,
             center,
-            4,
+            point_radius,
             point_color,
             -1,
             cv2.LINE_AA,
         )
-
-    cv2.putText(
-        output,
-        label,
-        (20, 35),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
-        point_color,
-        2,
-        cv2.LINE_AA,
-    )
 
     return output
 
@@ -544,14 +525,103 @@ def draw_bbox(
     output = image.copy()
 
     x1, y1, x2, y2 = (
-        bbox_xyxy.astype(int)
+        np.round(
+            bbox_xyxy
+        ).astype(int)
     )
 
     cv2.rectangle(
         output,
         (x1, y1),
         (x2, y2),
+        (255, 0, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    return output
+
+
+def draw_legend(
+    image: np.ndarray,
+    model_version: str,
+) -> np.ndarray:
+    output = image.copy()
+
+    overlay = output.copy()
+
+    cv2.rectangle(
+        overlay,
+        (10, 10),
+        (310, 78),
+        (0, 0, 0),
+        -1,
+    )
+
+    output = cv2.addWeighted(
+        overlay,
+        0.55,
+        output,
+        0.45,
+        0,
+    )
+
+    # Ground Truth legend.
+    cv2.line(
+        output,
+        (25, 32),
+        (55, 32),
+        (0, 200, 0),
+        3,
+        cv2.LINE_AA,
+    )
+
+    cv2.circle(
+        output,
+        (40, 32),
+        5,
+        (0, 255, 0),
+        -1,
+        cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        output,
+        "Ground Truth",
+        (68, 39),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+    # Prediction legend.
+    cv2.line(
+        output,
+        (25, 62),
+        (55, 62),
         (0, 255, 255),
+        3,
+        cv2.LINE_AA,
+    )
+
+    cv2.circle(
+        output,
+        (40, 62),
+        5,
+        (0, 0, 255),
+        -1,
+        cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        output,
+        f"Prediction - Model {model_version}",
+        (68, 69),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 0, 255),
         2,
         cv2.LINE_AA,
     )
@@ -590,11 +660,6 @@ def main() -> None:
         row["skeleton_frames"]
     )
 
-    usable_frames = min(
-        rgb_frames,
-        skeleton_frames,
-    )
-
     sample_frame_dir = (
         EXTRACTED_FRAMES_DIR
         / sample_id
@@ -606,6 +671,22 @@ def main() -> None:
             f"{sample_frame_dir}"
         )
 
+    output_video_path = (
+        OUTPUT_DIR
+        / (
+            f"{sample_id}_"
+            f"gt_prediction_model_{MODEL_VERSION}.mp4"
+        )
+    )
+
+    output_npz_path = (
+        OUTPUT_DIR
+        / (
+            f"{sample_id}_"
+            f"predictions_model_{MODEL_VERSION}.npz"
+        )
+    )
+
     print()
     print("=" * 70)
     print("NTU RGB+D heatmap video generation")
@@ -615,10 +696,9 @@ def main() -> None:
     print(f"Sample ID:          {sample_id}")
     print(f"Skeleton path:      {skeleton_path}")
     print(f"Frame directory:    {sample_frame_dir}")
-    print(f"Usable frames:      {usable_frames}")
     print(f"Person crop:        {PERSON_CROP}")
     print(f"BBox expansion:     {BBOX_EXPANSION}")
-    print(f"Output video:       {OUTPUT_VIDEO_PATH}")
+    print(f"Output video:       {output_video_path}")
 
     model = load_model(
         model_path=MODEL_PATH,
@@ -638,6 +718,18 @@ def main() -> None:
             sequence
         )
     )
+
+    pose_frames = len(
+        pose_sequence["color_xy"]
+    )
+
+    usable_frames = min(
+        rgb_frames,
+        skeleton_frames,
+        pose_frames,
+    )
+
+    print(f"Usable frames:      {usable_frames}")
 
     first_frame_path = (
         sample_frame_dir
@@ -659,17 +751,13 @@ def main() -> None:
         first_frame.shape[:2]
     )
 
-    video_width = original_width * 2
+    video_width = original_width
     video_height = original_height
 
-    fps = (
-        float(OUTPUT_FPS)
-        if OUTPUT_FPS is not None
-        else 30.0
-    )
+    fps = float(OUTPUT_FPS)
 
     writer = cv2.VideoWriter(
-        str(OUTPUT_VIDEO_PATH),
+        str(output_video_path),
         cv2.VideoWriter_fourcc(
             *"mp4v"
         ),
@@ -683,14 +771,15 @@ def main() -> None:
     if not writer.isOpened():
         raise RuntimeError(
             f"Could not create video writer: "
-            f"{OUTPUT_VIDEO_PATH}"
+            f"{output_video_path}"
         )
 
     saved_frame_indices = []
     saved_predictions = []
     saved_confidences = []
+    saved_predicted_visibility = []
     saved_ground_truth = []
-    saved_visibility = []
+    saved_ground_truth_visibility = []
     saved_bboxes = []
 
     try:
@@ -743,9 +832,7 @@ def main() -> None:
                         keypoints=gt_keypoints,
                         visibility=gt_visibility,
                         output_size=IMAGE_SIZE,
-                        expansion=(
-                            BBOX_EXPANSION
-                        ),
+                        expansion=BBOX_EXPANSION,
                         make_square=True,
                     )
                 )
@@ -768,6 +855,7 @@ def main() -> None:
 
             else:
                 model_image = frame.copy()
+
                 model_keypoints = (
                     gt_keypoints.copy()
                 )
@@ -811,8 +899,7 @@ def main() -> None:
             )
 
             predicted_visibility = (
-                confidence
-                >= CONFIDENCE_THRESHOLD
+                confidence >= CONFIDENCE_THRESHOLD
             ).astype(np.float32)
 
             if PERSON_CROP:
@@ -842,63 +929,70 @@ def main() -> None:
                     )
                 )
 
-            prediction_panel = (
-                draw_skeleton(
-                    image=frame,
-                    keypoints=(
-                        predicted_original_keypoints
-                    ),
-                    visibility=(
-                        predicted_visibility
-                    ),
-                    point_color=(0, 0, 255),
-                    line_color=(0, 255, 255),
-                    label=(
-                        f"Prediction - Model "
-                        f"{MODEL_VERSION}"
-                    ),
-                )
+            # =================================================
+            # Draw GT and prediction on the same frame
+            # =================================================
+
+            comparison_frame = frame.copy()
+
+            # Ground Truth:
+            # green points and green lines.
+            comparison_frame = draw_skeleton(
+                image=comparison_frame,
+                keypoints=gt_keypoints,
+                visibility=gt_visibility,
+                point_color=(0, 255, 0),
+                line_color=(0, 180, 0),
+                point_radius=4,
+                line_thickness=2,
+            )
+
+            # Prediction:
+            # red points and yellow lines.
+            comparison_frame = draw_skeleton(
+                image=comparison_frame,
+                keypoints=predicted_original_keypoints,
+                visibility=predicted_visibility,
+                point_color=(0, 0, 255),
+                line_color=(0, 255, 255),
+                point_radius=4,
+                line_thickness=2,
             )
 
             if PERSON_CROP:
-                prediction_panel = (
-                    draw_bbox(
-                        prediction_panel,
-                        person_bbox,
-                    )
+                comparison_frame = draw_bbox(
+                    image=comparison_frame,
+                    bbox_xyxy=person_bbox,
                 )
 
-            ground_truth_panel = (
-                draw_skeleton(
-                    image=frame,
-                    keypoints=gt_keypoints,
-                    visibility=gt_visibility,
-                    point_color=(0, 255, 0),
-                    line_color=(255, 255, 0),
-                    label="Ground Truth",
-                )
+            comparison_frame = draw_legend(
+                image=comparison_frame,
+                model_version=MODEL_VERSION,
             )
 
-            comparison_frame = np.concatenate(
-                [
-                    prediction_panel,
-                    ground_truth_panel,
-                ],
-                axis=1,
+            cv2.putText(
+                comparison_frame,
+                f"Sample: {sample_id}",
+                (
+                    20,
+                    comparison_frame.shape[0] - 50,
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
             )
 
             cv2.putText(
                 comparison_frame,
                 f"Frame: {frame_number}",
                 (
-                    comparison_frame.shape[1]
-                    // 2
-                    - 90,
-                    comparison_frame.shape[0]
-                    - 20,
+                    20,
+                    comparison_frame.shape[0] - 20,
                 ),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                0.65,
                 (255, 255, 255),
                 2,
                 cv2.LINE_AA,
@@ -920,11 +1014,15 @@ def main() -> None:
                 confidence
             )
 
+            saved_predicted_visibility.append(
+                predicted_visibility
+            )
+
             saved_ground_truth.append(
                 gt_keypoints
             )
 
-            saved_visibility.append(
+            saved_ground_truth_visibility.append(
                 gt_visibility
             )
 
@@ -951,7 +1049,7 @@ def main() -> None:
         )
 
     np.savez_compressed(
-        OUTPUT_NPZ_PATH,
+        output_npz_path,
         sample_id=np.array(
             sample_id
         ),
@@ -970,12 +1068,16 @@ def main() -> None:
             saved_confidences,
             dtype=np.float32,
         ),
+        predicted_visibility=np.asarray(
+            saved_predicted_visibility,
+            dtype=np.float32,
+        ),
         ground_truth=np.asarray(
             saved_ground_truth,
             dtype=np.float32,
         ),
-        visibility=np.asarray(
-            saved_visibility,
+        ground_truth_visibility=np.asarray(
+            saved_ground_truth_visibility,
             dtype=np.float32,
         ),
         person_bboxes=np.asarray(
@@ -1009,11 +1111,11 @@ def main() -> None:
     )
     print(
         f"Video: "
-        f"{OUTPUT_VIDEO_PATH}"
+        f"{output_video_path}"
     )
     print(
         f"Predictions: "
-        f"{OUTPUT_NPZ_PATH}"
+        f"{output_npz_path}"
     )
 
 
