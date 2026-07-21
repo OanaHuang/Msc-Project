@@ -86,11 +86,11 @@ HEATMAP_SIZE = 56
 NUM_JOINTS = 25
 HEATMAP_SIGMA = 2.0
 
-# Small local test configuration.
+# Full dataset.
 MAX_TRAIN_VIDEOS = None
 MAX_VAL_VIDEOS = None
 
-# Use one frame every 10 frames.
+# Use one frame every 5 frames.
 FRAME_STRIDE = 5
 
 BATCH_SIZE = 32
@@ -104,7 +104,20 @@ PRINT_EVERY = 50
 
 PRETRAINED = True
 
-# Leave as None to select the best available device automatically.
+
+# ============================================================
+# 5. Full-frame configuration
+# ============================================================
+
+# Model 06 uses the complete RGB frame.
+#
+# This must remain False so that training matches the
+# Model 06 video-generation and evaluation pipeline.
+PERSON_CROP = False
+
+
+# Leave as None to select the best available device
+# automatically.
 #
 # Examples:
 # DEVICE_NAME = "cpu"
@@ -116,7 +129,7 @@ PIN_MEMORY = torch.cuda.is_available()
 
 
 # ============================================================
-# 5. Dataset
+# 6. Dataset
 # ============================================================
 
 def build_datasets() -> tuple[
@@ -147,6 +160,7 @@ def build_datasets() -> tuple[
         single_person_only=True,
         max_samples=MAX_TRAIN_VIDEOS,
         skeleton_cache_size=8,
+        person_crop=PERSON_CROP,
     )
 
     val_dataset = NTUFrameDataset(
@@ -161,19 +175,26 @@ def build_datasets() -> tuple[
         single_person_only=True,
         max_samples=MAX_VAL_VIDEOS,
         skeleton_cache_size=8,
+        person_crop=PERSON_CROP,
     )
 
-    return train_dataset, val_dataset
+    return (
+        train_dataset,
+        val_dataset,
+    )
 
 
 # ============================================================
-# 6. DataLoader
+# 7. DataLoader
 # ============================================================
 
 def build_dataloaders(
     train_dataset: NTUFrameDataset,
     val_dataset: NTUFrameDataset,
-) -> tuple[DataLoader, DataLoader]:
+) -> tuple[
+    DataLoader,
+    DataLoader,
+]:
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
@@ -192,11 +213,14 @@ def build_dataloaders(
         drop_last=False,
     )
 
-    return train_loader, val_loader
+    return (
+        train_loader,
+        val_loader,
+    )
 
 
 # ============================================================
-# 7. Main
+# 8. Main
 # ============================================================
 
 def main() -> None:
@@ -215,28 +239,94 @@ def main() -> None:
     print("NTU RGB+D ResNet50 heatmap training")
     print("=" * 70)
 
-    print(f"Train CSV:         {TRAIN_CSV}")
-    print(f"Validation CSV:    {VAL_CSV}")
-    print(f"Output directory:  {OUTPUT_DIR}")
+    print(
+        f"Train CSV:         "
+        f"{TRAIN_CSV}"
+    )
+
+    print(
+        f"Validation CSV:    "
+        f"{VAL_CSV}"
+    )
+
+    print(
+        f"Output directory:  "
+        f"{OUTPUT_DIR}"
+    )
 
     print()
     print("Configuration")
     print("-" * 70)
 
-    print(f"Image size:        {IMAGE_SIZE}")
-    print(f"Heatmap size:      {HEATMAP_SIZE}")
-    print(f"Number of joints:  {NUM_JOINTS}")
-    print(f"Heatmap sigma:     {HEATMAP_SIGMA}")
+    print(
+        f"Image size:        "
+        f"{IMAGE_SIZE}"
+    )
 
-    print(f"Train videos:      {MAX_TRAIN_VIDEOS}")
-    print(f"Val videos:        {MAX_VAL_VIDEOS}")
-    print(f"Frame stride:      {FRAME_STRIDE}")
+    print(
+        f"Heatmap size:      "
+        f"{HEATMAP_SIZE}"
+    )
 
-    print(f"Batch size:        {BATCH_SIZE}")
-    print(f"Epochs:            {EPOCHS}")
-    print(f"Learning rate:     {LEARNING_RATE}")
-    print(f"Weight decay:      {WEIGHT_DECAY}")
-    print(f"Pretrained:        {PRETRAINED}")
+    print(
+        f"Number of joints:  "
+        f"{NUM_JOINTS}"
+    )
+
+    print(
+        f"Heatmap sigma:     "
+        f"{HEATMAP_SIGMA}"
+    )
+
+    print(
+        f"Train videos:      "
+        f"{MAX_TRAIN_VIDEOS}"
+    )
+
+    print(
+        f"Val videos:        "
+        f"{MAX_VAL_VIDEOS}"
+    )
+
+    print(
+        f"Frame stride:      "
+        f"{FRAME_STRIDE}"
+    )
+
+    print(
+        f"Batch size:        "
+        f"{BATCH_SIZE}"
+    )
+
+    print(
+        f"Epochs:            "
+        f"{EPOCHS}"
+    )
+
+    print(
+        f"Learning rate:     "
+        f"{LEARNING_RATE}"
+    )
+
+    print(
+        f"Weight decay:      "
+        f"{WEIGHT_DECAY}"
+    )
+
+    print(
+        f"Pretrained:        "
+        f"{PRETRAINED}"
+    )
+
+    print(
+        f"Person crop:       "
+        f"{PERSON_CROP}"
+    )
+
+    print(
+        "Input mode:        "
+        "Full RGB frame"
+    )
 
     train_dataset, val_dataset = (
         build_datasets()
@@ -312,6 +402,7 @@ def main() -> None:
             mode="min",
             factor=0.5,
             patience=2,
+            min_lr=1e-6,
         )
     )
 
@@ -327,7 +418,8 @@ def main() -> None:
         scheduler=scheduler,
         print_every=PRINT_EVERY,
         model_name=(
-            "NTU RGB+D ResNet50 Heatmap"
+            "NTU RGB+D ResNet50 "
+            "Heatmap Full Frame"
         ),
     )
 
@@ -367,4 +459,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()  
+    main()
