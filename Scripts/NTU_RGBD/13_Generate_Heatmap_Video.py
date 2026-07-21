@@ -62,7 +62,7 @@ from Scripts.NTU_RGBD.models import (
 
 # "06" = full-frame ResNet50
 # "12" = skeleton-guided person crop ResNet50
-MODEL_VERSION = "12"
+MODEL_VERSION = "06"
 
 IMAGE_SIZE = 224
 HEATMAP_SIZE = 56
@@ -86,7 +86,7 @@ DEVICE_NAME = None
 SKIP_EXISTING_VIDEOS = True
 
 # Keep False when generating all 344 videos to save disk space.
-SAVE_PREDICTION_NPZ = False
+SAVE_PREDICTION_NPZ = True
 
 # None = all test videos.
 # Change to 3 for a quick test.
