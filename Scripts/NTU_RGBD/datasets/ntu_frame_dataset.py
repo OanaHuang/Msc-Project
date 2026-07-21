@@ -24,6 +24,7 @@ from Scripts.NTU_RGBD.datasets.person_crop import (
     crop_and_resize_person,
 )
 
+
 # ============================================================
 # 1. Extracted frame directory
 # ============================================================
@@ -149,6 +150,7 @@ def generate_gaussian_heatmaps(
 # ============================================================
 # 3. Dataset
 # ============================================================
+
 class NTUFrameDataset(Dataset):
     def __init__(
         self,
@@ -164,21 +166,36 @@ class NTUFrameDataset(Dataset):
         extracted_frames_dir=None,
         person_crop: bool = True,
         bbox_expansion: float = 0.25,
+        validate_pose_sequences: bool = True,
     ):
         super().__init__()
 
-        self.metadata_csv = Path(metadata_csv)
+        self.metadata_csv = Path(
+            metadata_csv
+        )
+
         self.transform = transform
         self.image_size = image_size
         self.heatmap_size = heatmap_size
         self.sigma = sigma
         self.frame_stride = frame_stride
-        self.single_person_only = single_person_only
+        self.single_person_only = (
+            single_person_only
+        )
+
         self.max_samples = max_samples
-        self.skeleton_cache_size = skeleton_cache_size
+        self.skeleton_cache_size = (
+            skeleton_cache_size
+        )
 
         self.person_crop = person_crop
-        self.bbox_expansion = bbox_expansion
+        self.bbox_expansion = (
+            bbox_expansion
+        )
+
+        self.validate_pose_sequences = (
+            validate_pose_sequences
+        )
 
         if self.bbox_expansion < 0:
             raise ValueError(
@@ -203,7 +220,7 @@ class NTUFrameDataset(Dataset):
 
         if not self.extracted_frames_dir.exists():
             raise FileNotFoundError(
-                f"Extracted frames directory "
+                "Extracted frames directory "
                 f"not found: "
                 f"{self.extracted_frames_dir}\n"
                 "Run 05a_Extract_RGB_Frames.py first."
@@ -214,7 +231,19 @@ class NTUFrameDataset(Dataset):
                 "frame_stride must be positive"
             )
 
-        self.samples = self._load_metadata(
+        if skeleton_cache_size <= 0:
+            raise ValueError(
+                "skeleton_cache_size must be positive"
+            )
+
+        # Skeleton cache is created before metadata validation.
+        # Validated pose sequences can therefore be reused later.
+        self._skeleton_cache = OrderedDict()
+
+        (
+            self.samples,
+            self.skipped_samples,
+        ) = self._load_metadata(
             single_person_only=(
                 single_person_only
             ),
@@ -225,25 +254,265 @@ class NTUFrameDataset(Dataset):
             self._build_frame_index()
         )
 
-        self._skeleton_cache = OrderedDict()
+        if not self.frame_index:
+            raise RuntimeError(
+                "No valid frames remained after "
+                "dataset filtering."
+            )
+
+        print()
+        print("=" * 70)
+        print("NTUFrameDataset")
+        print("=" * 70)
 
         print(
-            f"NTUFrameDataset: "
-            f"{len(self.samples)} videos, "
-            f"{len(self.frame_index)} frames"
+            f"Metadata CSV:        "
+            f"{self.metadata_csv}"
         )
 
         print(
-            f"Extracted frames: "
+            f"Valid videos:        "
+            f"{len(self.samples)}"
+        )
+
+        print(
+            f"Skipped videos:      "
+            f"{len(self.skipped_samples)}"
+        )
+
+        print(
+            f"Usable frames:       "
+            f"{len(self.frame_index)}"
+        )
+
+        print(
+            f"Extracted frames:    "
             f"{self.extracted_frames_dir}"
+        )
+
+        print(
+            f"Person crop:         "
+            f"{self.person_crop}"
+        )
+
+        print(
+            f"Validate skeletons:  "
+            f"{self.validate_pose_sequences}"
+        )
+
+        if self.skipped_samples:
+            print()
+            print("Skipped sample examples:")
+
+            for item in self.skipped_samples[:10]:
+                print(
+                    f"  {item['sample_id']} | "
+                    f"{item['reason']}"
+                )
+
+            if len(self.skipped_samples) > 10:
+                print(
+                    f"  ... and "
+                    f"{len(self.skipped_samples) - 10} "
+                    f"more"
+                )
+
+        print("=" * 70)
+        print()
+
+    # ========================================================
+    # 4. Metadata loading and validation
+    # ========================================================
+
+    @staticmethod
+    def _string_to_bool(
+        value,
+    ) -> bool:
+        return str(
+            value
+        ).strip().lower() in {
+            "true",
+            "1",
+            "yes",
+        }
+
+    @staticmethod
+    def _safe_int(
+        value,
+        default: int = 0,
+    ) -> int:
+        try:
+            return int(
+                float(value)
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return default
+
+    def _metadata_pose_is_empty(
+        self,
+        row: dict,
+    ) -> tuple[bool, str]:
+        """
+        Fast metadata-level rejection.
+
+        Returns:
+            is_empty
+            rejection reason
+        """
+        max_bodies = self._safe_int(
+            row.get(
+                "max_bodies",
+                0,
+            )
+        )
+
+        skeleton_frames = self._safe_int(
+            row.get(
+                "skeleton_frames",
+                0,
+            )
+        )
+
+        empty_frames = self._safe_int(
+            row.get(
+                "empty_frames",
+                0,
+            )
+        )
+
+        if skeleton_frames <= 0:
+            return (
+                True,
+                "skeleton_frames <= 0",
+            )
+
+        if max_bodies <= 0:
+            return (
+                True,
+                "max_bodies <= 0",
+            )
+
+        if empty_frames >= skeleton_frames:
+            return (
+                True,
+                "all skeleton frames are empty",
+            )
+
+        return (
+            False,
+            "",
+        )
+
+    def _validate_pose_sequence(
+        self,
+        skeleton_path: Path,
+    ) -> tuple[bool, str]:
+        """
+        Strictly verify that the skeleton file contains a
+        primary pose sequence that the Dataset can use.
+
+        Validation is performed once per video during Dataset
+        initialisation, not once per frame.
+        """
+        if not skeleton_path.exists():
+            return (
+                False,
+                f"skeleton file not found: "
+                f"{skeleton_path}",
+            )
+
+        try:
+            pose_sequence = (
+                self._load_pose_sequence(
+                    skeleton_path
+                )
+            )
+
+        except Exception as error:
+            return (
+                False,
+                f"{type(error).__name__}: "
+                f"{error}",
+            )
+
+        if "color_xy" not in pose_sequence:
+            return (
+                False,
+                "pose sequence has no color_xy",
+            )
+
+        if "tracking_state" not in pose_sequence:
+            return (
+                False,
+                "pose sequence has no tracking_state",
+            )
+
+        color_xy = np.asarray(
+            pose_sequence["color_xy"]
+        )
+
+        tracking_state = np.asarray(
+            pose_sequence["tracking_state"]
+        )
+
+        if color_xy.ndim != 3:
+            return (
+                False,
+                "color_xy has invalid shape: "
+                f"{color_xy.shape}",
+            )
+
+        if tracking_state.ndim != 2:
+            return (
+                False,
+                "tracking_state has invalid shape: "
+                f"{tracking_state.shape}",
+            )
+
+        if color_xy.shape[0] <= 0:
+            return (
+                False,
+                "pose sequence contains no frames",
+            )
+
+        if (
+            tracking_state.shape[0]
+            != color_xy.shape[0]
+        ):
+            return (
+                False,
+                "pose and tracking frame counts differ",
+            )
+
+        if not np.isfinite(
+            color_xy
+        ).any():
+            return (
+                False,
+                "all pose coordinates are non-finite",
+            )
+
+        return (
+            True,
+            "",
         )
 
     def _load_metadata(
         self,
         single_person_only: bool,
         max_samples: Optional[int],
-    ) -> list[dict]:
-        rows = []
+    ) -> tuple[
+        list[dict],
+        list[dict[str, str]],
+    ]:
+        valid_rows: list[dict] = []
+        skipped_rows: list[
+            dict[str, str]
+        ] = []
 
         with self.metadata_csv.open(
             "r",
@@ -254,53 +523,153 @@ class NTUFrameDataset(Dataset):
             )
 
             for row in reader:
-                if single_person_only:
-                    value = str(
-                        row.get(
-                            "is_single_person",
-                            "",
-                        )
-                    ).strip().lower()
+                sample_id = str(
+                    row.get(
+                        "sample_id",
+                        "",
+                    )
+                ).strip()
 
-                    if value not in {
-                        "true",
-                        "1",
-                        "yes",
-                    }:
+                if not sample_id:
+                    skipped_rows.append(
+                        {
+                            "sample_id": "<missing>",
+                            "reason": (
+                                "missing sample_id"
+                            ),
+                        }
+                    )
+                    continue
+
+                if single_person_only:
+                    is_single_person = (
+                        self._string_to_bool(
+                            row.get(
+                                "is_single_person",
+                                "",
+                            )
+                        )
+                    )
+
+                    if not is_single_person:
+                        skipped_rows.append(
+                            {
+                                "sample_id": (
+                                    sample_id
+                                ),
+                                "reason": (
+                                    "not single-person"
+                                ),
+                            }
+                        )
                         continue
 
-                rows.append(
+                is_empty, empty_reason = (
+                    self._metadata_pose_is_empty(
+                        row
+                    )
+                )
+
+                if is_empty:
+                    skipped_rows.append(
+                        {
+                            "sample_id": (
+                                sample_id
+                            ),
+                            "reason": (
+                                empty_reason
+                            ),
+                        }
+                    )
+                    continue
+
+                skeleton_path = Path(
+                    str(
+                        row.get(
+                            "skeleton_path",
+                            "",
+                        )
+                    )
+                )
+
+                if self.validate_pose_sequences:
+                    (
+                        is_valid,
+                        validation_reason,
+                    ) = self._validate_pose_sequence(
+                        skeleton_path
+                    )
+
+                    if not is_valid:
+                        skipped_rows.append(
+                            {
+                                "sample_id": (
+                                    sample_id
+                                ),
+                                "reason": (
+                                    validation_reason
+                                ),
+                            }
+                        )
+                        continue
+
+                valid_rows.append(
                     row
                 )
 
                 if (
                     max_samples is not None
-                    and len(rows) >= max_samples
+                    and len(valid_rows)
+                    >= max_samples
                 ):
                     break
 
-        if not rows:
+        if not valid_rows:
             raise RuntimeError(
-                "No valid samples found "
-                "in metadata CSV"
+                "No valid samples remained after "
+                "metadata and pose validation."
             )
 
-        return rows
+        return (
+            valid_rows,
+            skipped_rows,
+        )
+
+    # ========================================================
+    # 5. Frame index
+    # ========================================================
 
     def _build_frame_index(
         self,
     ) -> list[tuple[int, int]]:
-        frame_index = []
+        frame_index: list[
+            tuple[int, int]
+        ] = []
 
-        for sample_index, sample in enumerate(
-            self.samples
-        ):
-            rgb_frames = int(
-                sample["rgb_frames"]
+        valid_samples: list[dict] = []
+        skipped_missing_frames: list[
+            dict[str, str]
+        ] = []
+
+        for sample in self.samples:
+            sample_id = str(
+                sample["sample_id"]
             )
 
-            skeleton_frames = int(
-                sample["skeleton_frames"]
+            rgb_frames = self._safe_int(
+                sample.get(
+                    "rgb_frames",
+                    0,
+                )
+            )
+
+            skeleton_frames = (
+                self._safe_int(
+                    sample.get(
+                        "skeleton_frames",
+                        0,
+                    )
+                )
             )
 
             usable_frames = min(
@@ -308,19 +677,96 @@ class NTUFrameDataset(Dataset):
                 skeleton_frames,
             )
 
+            if usable_frames <= 0:
+                skipped_missing_frames.append(
+                    {
+                        "sample_id": sample_id,
+                        "reason": (
+                            "usable frame count <= 0"
+                        ),
+                    }
+                )
+                continue
+
+            # Verify that the sample frame directory exists.
+            sample_frame_dir = (
+                self.extracted_frames_dir
+                / sample_id
+            )
+
+            if not sample_frame_dir.exists():
+                skipped_missing_frames.append(
+                    {
+                        "sample_id": sample_id,
+                        "reason": (
+                            "extracted frame directory "
+                            "not found"
+                        ),
+                    }
+                )
+                continue
+
+            new_sample_index = len(
+                valid_samples
+            )
+
+            sample_frame_indices = []
+
             for frame_number in range(
                 0,
                 usable_frames,
                 self.frame_stride,
             ):
-                frame_index.append(
+                frame_path = (
+                    sample_frame_dir
+                    / (
+                        f"frame_"
+                        f"{frame_number:06d}.jpg"
+                    )
+                )
+
+                # Missing individual frames are skipped.
+                # They no longer terminate training.
+                if not frame_path.exists():
+                    continue
+
+                sample_frame_indices.append(
                     (
-                        sample_index,
+                        new_sample_index,
                         frame_number,
                     )
                 )
 
+            if not sample_frame_indices:
+                skipped_missing_frames.append(
+                    {
+                        "sample_id": sample_id,
+                        "reason": (
+                            "no extracted frames found"
+                        ),
+                    }
+                )
+                continue
+
+            valid_samples.append(
+                sample
+            )
+
+            frame_index.extend(
+                sample_frame_indices
+            )
+
+        self.samples = valid_samples
+
+        self.skipped_samples.extend(
+            skipped_missing_frames
+        )
+
         return frame_index
+
+    # ========================================================
+    # 6. Skeleton loading and cache
+    # ========================================================
 
     def _load_pose_sequence(
         self,
@@ -365,6 +811,10 @@ class NTUFrameDataset(Dataset):
 
         return pose_sequence
 
+    # ========================================================
+    # 7. Frame path
+    # ========================================================
+
     def _get_frame_path(
         self,
         sample_id: str,
@@ -375,6 +825,10 @@ class NTUFrameDataset(Dataset):
             / sample_id
             / f"frame_{frame_number:06d}.jpg"
         )
+
+    # ========================================================
+    # 8. Dataset interface
+    # ========================================================
 
     def __len__(
         self,
@@ -408,6 +862,8 @@ class NTUFrameDataset(Dataset):
             frame_number=frame_number,
         )
 
+        # This should not normally happen because missing
+        # frames were removed in _build_frame_index().
         if not frame_path.exists():
             raise FileNotFoundError(
                 f"Extracted frame not found: "
@@ -421,7 +877,7 @@ class NTUFrameDataset(Dataset):
 
         if image is None:
             raise RuntimeError(
-                f"Could not read extracted frame: "
+                "Could not read extracted frame: "
                 f"{frame_path}"
             )
 
@@ -430,6 +886,18 @@ class NTUFrameDataset(Dataset):
                 skeleton_path
             )
         )
+
+        if (
+            frame_number
+            >= len(
+                pose_sequence["color_xy"]
+            )
+        ):
+            raise IndexError(
+                f"Pose frame index out of range: "
+                f"sample={sample_id}, "
+                f"frame={frame_number}"
+            )
 
         keypoints = pose_sequence[
             "color_xy"
@@ -453,23 +921,36 @@ class NTUFrameDataset(Dataset):
             np.float32
         )
 
-        original_keypoints = keypoints.copy()
-        original_visibility = visibility.copy()
+        original_keypoints = (
+            keypoints.copy()
+        )
+
+        original_visibility = (
+            visibility.copy()
+        )
 
         if self.person_crop:
-            crop_result = crop_and_resize_person(
-                image=image,
-                keypoints=keypoints,
-                visibility=visibility,
-                output_size=self.image_size,
-                expansion=self.bbox_expansion,
-                make_square=True,
+            crop_result = (
+                crop_and_resize_person(
+                    image=image,
+                    keypoints=keypoints,
+                    visibility=visibility,
+                    output_size=(
+                        self.image_size
+                    ),
+                    expansion=(
+                        self.bbox_expansion
+                    ),
+                    make_square=True,
+                )
             )
 
             image = crop_result.image
             keypoints = crop_result.keypoints
             visibility = crop_result.visibility
-            person_bbox = crop_result.bbox_xyxy
+            person_bbox = (
+                crop_result.bbox_xyxy
+            )
 
         else:
             person_bbox = np.array(
