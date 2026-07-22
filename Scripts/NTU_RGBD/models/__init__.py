@@ -11,6 +11,11 @@ from .ms_spiking_resnet50_heatmap import (
     build_ms_spiking_resnet50_heatmap,
 )
 
+from .ms_spiking_resnet50_membrane_heatmap import (
+    MSSpikingResNet50MembraneHeatmap,
+    build_ms_spiking_resnet50_membrane_heatmap,
+)
+
 __all__ = [
     "ResNetHeatmapModel",
     "build_resnet18_heatmap",
@@ -19,4 +24,6 @@ __all__ = [
     "MSResidualSpikingBottleneck",
     "MSSpikingResNet50Heatmap",
     "build_ms_spiking_resnet50_heatmap",
+    "MSSpikingResNet50MembraneHeatmap",
+    "build_ms_spiking_resnet50_membrane_heatmap",
 ]
