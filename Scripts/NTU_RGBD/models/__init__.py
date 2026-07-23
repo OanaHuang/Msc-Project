@@ -16,7 +16,7 @@ from .ms_spiking_resnet50_membrane_heatmap import (
     build_ms_spiking_resnet50_membrane_heatmap,
 )
 
-from .SpikeYOLO_Style_LIF_Heatmap import (
+from .spikeyolo_style_lif_heatmap import (
     LIFActivation,
     LIFStandardConv,
     LIFDownSampling,
@@ -27,7 +27,7 @@ from .SpikeYOLO_Style_LIF_Heatmap import (
     build_spikeyolo_style_lif_heatmap,
 )
 
-from .SpikeYOLO_Style_ILIF_Heatmap import (
+from .spikeyolo_style_ilif_heatmap import (
     IntegerSpikeSTE,
     ILIFActivation,
     ILIFStandardConv,

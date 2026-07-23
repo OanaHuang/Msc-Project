@@ -39,7 +39,7 @@ from Scripts.NTU_RGBD.datasets import (
     build_eval_transform,
 )
 
-from Scripts.NTU_RGBD.models.SpikeYOLO_Style_ILIF_Heatmap import (
+from Scripts.NTU_RGBD.models.spikeyolo_style_ilif_heatmap import (
     build_spikeyolo_style_ilif_heatmap,
 )
 
