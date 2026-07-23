@@ -29,7 +29,8 @@ from .spikeyolo_style_lif_heatmap import (
 
 from .spikeyolo_style_ilif_heatmap import (
     IntegerSpikeSTE,
-    ILIFActivation,
+    MultiStepILIF,
+    TimeDistributedConvBN,
     ILIFStandardConv,
     ILIFDownSampling,
     ILIFSepConv,
@@ -60,7 +61,8 @@ __all__ = [
     "build_spikeyolo_style_lif_heatmap",
 
     "IntegerSpikeSTE",
-    "ILIFActivation",
+    "MultiStepILIF",
+    "TimeDistributedConvBN",
     "ILIFStandardConv",
     "ILIFDownSampling",
     "ILIFSepConv",
