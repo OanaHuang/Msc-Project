@@ -101,7 +101,7 @@ SAVE_PREDICTION_NPZ = True
 
 # Use 1 or 3 for a quick test.
 # Use None to process every single-person test video.
-MAX_TEST_VIDEOS = 1
+MAX_TEST_VIDEOS = None
 
 
 # ============================================================
