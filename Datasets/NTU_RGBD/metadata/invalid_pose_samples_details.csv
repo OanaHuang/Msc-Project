@@ -1,0 +1,5 @@
+sample_id,skeleton_path,error_type,error
+S001C002P006R001A008,/home/yunhao/MSc_Project/Datasets/NTU_RGBD/skeletons/S001_to_S017/S001C002P006R001A008.skeleton,ValueError,No valid body found in /home/yunhao/MSc_Project/Datasets/NTU_RGBD/skeletons/S001_to_S017/S001C002P006R001A008.skeleton
+S001C003P005R002A004,/home/yunhao/MSc_Project/Datasets/NTU_RGBD/skeletons/S001_to_S017/S001C003P005R002A004.skeleton,ValueError,No valid body found in /home/yunhao/MSc_Project/Datasets/NTU_RGBD/skeletons/S001_to_S017/S001C003P005R002A004.skeleton
+S001C003P005R002A005,/home/yunhao/MSc_Project/Datasets/NTU_RGBD/skeletons/S001_to_S017/S001C003P005R002A005.skeleton,ValueError,No valid body found in /home/yunhao/MSc_Project/Datasets/NTU_RGBD/skeletons/S001_to_S017/S001C003P005R002A005.skeleton
+S001C003P005R002A006,/home/yunhao/MSc_Project/Datasets/NTU_RGBD/skeletons/S001_to_S017/S001C003P005R002A006.skeleton,ValueError,No valid body found in /home/yunhao/MSc_Project/Datasets/NTU_RGBD/skeletons/S001_to_S017/S001C003P005R002A006.skeleton

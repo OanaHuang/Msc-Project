@@ -5,7 +5,7 @@ Skeleton files: 56880
 Matched IDs: 2880
 Inspected matched samples: 2880
 Frame-count matches: 2880
-Single-person samples: 2284
+Single-person samples: 2123
 Missing RGB: 54000
 Missing skeleton: 0
 Failed inspections: 0
