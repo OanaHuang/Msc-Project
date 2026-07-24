@@ -17,6 +17,9 @@ EPSILON = 1e-8
 def _as_float_array(
     array: np.ndarray,
 ) -> np.ndarray:
+    """
+    Convert input to a NumPy float64 array.
+    """
     return np.asarray(
         array,
         dtype=np.float64,
@@ -30,6 +33,18 @@ def _prepare_mask(
     """
     Prepare a boolean mask matching all dimensions except the
     coordinate dimension.
+
+    Parameters
+    ----------
+    mask:
+        Optional visibility or validity mask.
+    target_shape:
+        Desired output shape.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask with shape target_shape.
     """
     if mask is None:
         return np.ones(
@@ -53,19 +68,101 @@ def _prepare_mask(
     return mask > 0
 
 
+def _broadcast_normalization_length(
+    normalization_length: np.ndarray | float,
+    target_shape: tuple,
+) -> np.ndarray:
+    """
+    Broadcast a normalization length to the distance-array shape.
+
+    Common supported inputs include:
+
+        scalar
+        [N]
+        [N, 1]
+        [N, J]
+
+    Parameters
+    ----------
+    normalization_length:
+        Scalar or array containing one or more normalization values.
+    target_shape:
+        Shape of the distance array, usually [N, J].
+
+    Returns
+    -------
+    np.ndarray
+        Broadcast normalization array with shape target_shape.
+    """
+    normalization_length = _as_float_array(
+        normalization_length
+    )
+
+    try:
+        return np.broadcast_to(
+            normalization_length,
+            target_shape,
+        )
+    except ValueError as original_exc:
+        # Common case:
+        # normalization_length shape [N]
+        # target shape [N, J]
+        if (
+            normalization_length.ndim
+            == len(target_shape) - 1
+        ):
+            expanded = np.expand_dims(
+                normalization_length,
+                axis=-1,
+            )
+
+            try:
+                return np.broadcast_to(
+                    expanded,
+                    target_shape,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "normalization_length with shape "
+                    f"{normalization_length.shape} cannot be "
+                    f"broadcast to target shape {target_shape}"
+                ) from exc
+
+        raise ValueError(
+            "normalization_length with shape "
+            f"{normalization_length.shape} cannot be broadcast "
+            f"to target shape {target_shape}"
+        ) from original_exc
+
+
 def euclidean_distance(
     prediction: np.ndarray,
     target: np.ndarray,
 ) -> np.ndarray:
     """
     Compute Euclidean distance over the final coordinate axis.
+
+    Examples
+    --------
+    Input shape:
+        [N, J, 2]
+
+    Output shape:
+        [N, J]
     """
     prediction = _as_float_array(prediction)
     target = _as_float_array(target)
 
     if prediction.shape != target.shape:
         raise ValueError(
-            "prediction and target must have the same shape"
+            "prediction and target must have the same shape, "
+            f"but received {prediction.shape} and {target.shape}"
+        )
+
+    if prediction.shape[-1] not in (2, 3):
+        raise ValueError(
+            "The final dimension should normally contain "
+            "2D or 3D coordinates"
         )
 
     return np.linalg.norm(
@@ -88,18 +185,32 @@ def compute_pck(
     """
     Compute Percentage of Correct Keypoints.
 
-    A joint is correct when:
+    A joint is counted as correct when:
 
-        distance <= threshold * normalization_length
+        Euclidean distance <= threshold * normalization_length
+
+    This is a generic normalized keypoint metric. The meaning of
+    the metric depends on the supplied normalization length.
+
+    Examples
+    --------
+    Bounding-box normalization:
+        normalization_length = person bounding-box size
+
+    Torso normalization:
+        normalization_length = torso length
+
+    Head normalization:
+        normalization_length = head length
 
     Parameters
     ----------
     prediction:
-        Shape [..., J, 2].
+        Predicted coordinates with shape [..., J, C].
     target:
-        Shape [..., J, 2].
+        Ground-truth coordinates with shape [..., J, C].
     normalization_length:
-        Scalar or array broadcastable to distance shape.
+        Scalar or array broadcastable to the distance shape.
     threshold:
         PCK threshold.
     visibility:
@@ -108,7 +219,7 @@ def compute_pck(
     Returns
     -------
     float
-        PCK in percentage form, between 0 and 100.
+        PCK percentage between 0 and 100.
     """
     if threshold <= 0:
         raise ValueError(
@@ -120,35 +231,10 @@ def compute_pck(
         target,
     )
 
-    normalization_length = _as_float_array(
-        normalization_length
+    normalization_length = _broadcast_normalization_length(
+        normalization_length,
+        distances.shape,
     )
-
-    try:
-        normalization_length = np.broadcast_to(
-            normalization_length,
-            distances.shape,
-        )
-    except ValueError as exc:
-        # Common case: one normalization value per sample.
-        if (
-            normalization_length.ndim
-            == distances.ndim - 1
-        ):
-            normalization_length = np.expand_dims(
-                normalization_length,
-                axis=-1,
-            )
-
-            normalization_length = np.broadcast_to(
-                normalization_length,
-                distances.shape,
-            )
-        else:
-            raise ValueError(
-                "normalization_length cannot be broadcast "
-                f"to distance shape {distances.shape}"
-            ) from exc
 
     valid = _prepare_mask(
         visibility,
@@ -184,15 +270,27 @@ def compute_pck_per_joint(
     """
     Compute PCK separately for every joint.
 
-    Expected shape:
-        [N, J, 2]
+    Expected input shape:
+        prediction: [N, J, C]
+        target:     [N, J, C]
+        visibility: [N, J]
+
+    Returns
+    -------
+    np.ndarray
+        Shape [J], containing PCK percentages.
     """
     prediction = _as_float_array(prediction)
     target = _as_float_array(target)
 
+    if prediction.shape != target.shape:
+        raise ValueError(
+            "prediction and target must have the same shape"
+        )
+
     if prediction.ndim != 3:
         raise ValueError(
-            "prediction must have shape [N, J, 2]"
+            "prediction must have shape [N, J, C]"
         )
 
     num_joints = prediction.shape[1]
@@ -205,6 +303,18 @@ def compute_pck_per_joint(
 
     if visibility is not None:
         visibility = np.asarray(visibility)
+
+        if visibility.shape != prediction.shape[:-1]:
+            try:
+                visibility = np.broadcast_to(
+                    visibility,
+                    prediction.shape[:-1],
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"visibility shape {visibility.shape} cannot "
+                    f"match joint shape {prediction.shape[:-1]}"
+                ) from exc
 
     for joint_index in range(num_joints):
         joint_visibility = None
@@ -224,7 +334,103 @@ def compute_pck_per_joint(
 
 
 # ============================================================
-# 3. MPJPE
+# 3. PCKh
+# ============================================================
+
+def compute_pckh(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    head_length: np.ndarray | float,
+    threshold: float = 0.5,
+    visibility: Optional[np.ndarray] = None,
+) -> float:
+    """
+    Compute Percentage of Correct Keypoints normalized by head size.
+
+    A joint is counted as correct when:
+
+        Euclidean distance <= threshold * head_length
+
+    For PCKh@0.5:
+
+        threshold = 0.5
+
+    Parameters
+    ----------
+    prediction:
+        Predicted coordinates with shape [..., J, C].
+    target:
+        Ground-truth coordinates with shape [..., J, C].
+    head_length:
+        Head normalization length.
+
+        Common shapes:
+            scalar
+            [N]
+            [N, 1]
+            [N, J]
+
+        For video data, this may also be one value per frame.
+    threshold:
+        PCKh threshold. Default is 0.5.
+    visibility:
+        Optional mask with shape [..., J].
+
+    Returns
+    -------
+    float
+        PCKh percentage between 0 and 100.
+
+    Notes
+    -----
+    The exact interpretation of PCKh depends on how head_length
+    is defined.
+
+    MPII-style PCKh normally uses a head bounding-box-derived
+    head size. If head-to-neck joint distance is used instead,
+    this should be documented clearly in the experiment report.
+    """
+    return compute_pck(
+        prediction=prediction,
+        target=target,
+        normalization_length=head_length,
+        threshold=threshold,
+        visibility=visibility,
+    )
+
+
+def compute_pckh_per_joint(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    head_length: np.ndarray | float,
+    threshold: float = 0.5,
+    visibility: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Compute PCKh separately for every joint.
+
+    Expected input shape:
+        prediction: [N, J, C]
+        target:     [N, J, C]
+        visibility: [N, J]
+        head_length:[N], [N, 1], or scalar
+
+    Returns
+    -------
+    np.ndarray
+        Shape [J], containing per-joint PCKh percentages.
+    """
+    return compute_pck_per_joint(
+        prediction=prediction,
+        target=target,
+        normalization_length=head_length,
+        threshold=threshold,
+        visibility=visibility,
+    )
+
+
+# ============================================================
+# 4. MPJPE
 # ============================================================
 
 def compute_mpjpe(
@@ -235,10 +441,22 @@ def compute_mpjpe(
     """
     Compute Mean Per Joint Position Error.
 
-    Supports 2D or 3D coordinates, though MPJPE is normally used
-    for 3D pose.
+    Supports 2D or 3D coordinates, although MPJPE is commonly
+    used for 3D pose estimation.
 
-    Returns the value in the same unit as the input coordinates.
+    Parameters
+    ----------
+    prediction:
+        Predicted coordinates.
+    target:
+        Ground-truth coordinates.
+    visibility:
+        Optional joint validity mask.
+
+    Returns
+    -------
+    float
+        Mean error in the same unit as the input coordinates.
     """
     distances = euclidean_distance(
         prediction,
@@ -270,9 +488,19 @@ def compute_mpjpe_per_joint(
 
     Expected shape:
         [N, J, C]
+
+    Returns
+    -------
+    np.ndarray
+        Shape [J].
     """
     prediction = _as_float_array(prediction)
     target = _as_float_array(target)
+
+    if prediction.shape != target.shape:
+        raise ValueError(
+            "prediction and target must have the same shape"
+        )
 
     if prediction.ndim != 3:
         raise ValueError(
@@ -287,13 +515,16 @@ def compute_mpjpe_per_joint(
         dtype=np.float64,
     )
 
+    if visibility is not None:
+        visibility = np.asarray(visibility)
+
     for joint_index in range(num_joints):
         joint_visibility = None
 
         if visibility is not None:
-            joint_visibility = np.asarray(
-                visibility
-            )[:, joint_index]
+            joint_visibility = (
+                visibility[:, joint_index]
+            )
 
         results[joint_index] = compute_mpjpe(
             prediction[:, joint_index],
@@ -305,7 +536,7 @@ def compute_mpjpe_per_joint(
 
 
 # ============================================================
-# 4. Temporal derivatives
+# 5. Temporal derivatives
 # ============================================================
 
 def compute_velocity(
@@ -313,7 +544,7 @@ def compute_velocity(
     fps: float = 1.0,
 ) -> np.ndarray:
     """
-    Compute first temporal derivative.
+    Compute the first temporal derivative.
 
     Parameters
     ----------
@@ -339,6 +570,7 @@ def compute_velocity(
             0,
             *sequence.shape[1:],
         )
+
         return np.empty(
             shape,
             dtype=np.float64,
@@ -360,9 +592,19 @@ def compute_acceleration(
     fps: float = 1.0,
 ) -> np.ndarray:
     """
-    Compute second temporal derivative.
+    Compute the second temporal derivative.
 
-    Returns shape [T - 2, J, C].
+    Parameters
+    ----------
+    sequence:
+        Shape [T, J, C].
+    fps:
+        Frames per second.
+
+    Returns
+    -------
+    np.ndarray
+        Shape [T - 2, J, C].
     """
     velocity = compute_velocity(
         sequence,
@@ -374,6 +616,7 @@ def compute_acceleration(
             0,
             *sequence.shape[1:],
         )
+
         return np.empty(
             shape,
             dtype=np.float64,
@@ -390,9 +633,19 @@ def compute_jerk(
     fps: float = 1.0,
 ) -> np.ndarray:
     """
-    Compute third temporal derivative.
+    Compute the third temporal derivative.
 
-    Returns shape [T - 3, J, C].
+    Parameters
+    ----------
+    sequence:
+        Shape [T, J, C].
+    fps:
+        Frames per second.
+
+    Returns
+    -------
+    np.ndarray
+        Shape [T - 3, J, C].
     """
     acceleration = compute_acceleration(
         sequence,
@@ -404,6 +657,7 @@ def compute_jerk(
             0,
             *sequence.shape[1:],
         )
+
         return np.empty(
             shape,
             dtype=np.float64,
@@ -416,7 +670,7 @@ def compute_jerk(
 
 
 # ============================================================
-# 5. Temporal stability metrics
+# 6. Temporal stability metrics
 # ============================================================
 
 def compute_velocity_error(
@@ -441,7 +695,9 @@ def compute_velocity_error(
     velocity_visibility = None
 
     if visibility is not None:
-        visibility = np.asarray(visibility)
+        visibility = np.asarray(
+            visibility
+        ).astype(bool)
 
         velocity_visibility = (
             visibility[:-1]
@@ -477,7 +733,9 @@ def compute_acceleration_error(
     acceleration_visibility = None
 
     if visibility is not None:
-        visibility = np.asarray(visibility)
+        visibility = np.asarray(
+            visibility
+        ).astype(bool)
 
         acceleration_visibility = (
             visibility[:-2]
@@ -500,9 +758,10 @@ def compute_acceleration_jitter(
     """
     Measure the average magnitude of predicted acceleration.
 
-    A lower value generally indicates smoother motion, but it must
-    not be interpreted alone because real fast actions naturally
-    have larger acceleration.
+    A lower value generally indicates smoother motion.
+
+    This metric should not be interpreted alone because genuine
+    fast movements naturally contain larger acceleration.
     """
     acceleration = compute_acceleration(
         sequence,
@@ -520,7 +779,9 @@ def compute_acceleration_jitter(
     valid = np.isfinite(magnitude)
 
     if visibility is not None:
-        visibility = np.asarray(visibility)
+        visibility = np.asarray(
+            visibility
+        ).astype(bool)
 
         acceleration_visibility = (
             visibility[:-2]
@@ -545,6 +806,9 @@ def compute_jerk_jitter(
 ) -> float:
     """
     Measure mean jerk magnitude.
+
+    A lower value generally indicates smoother changes in
+    acceleration.
     """
     jerk = compute_jerk(
         sequence,
@@ -562,7 +826,9 @@ def compute_jerk_jitter(
     valid = np.isfinite(magnitude)
 
     if visibility is not None:
-        visibility = np.asarray(visibility)
+        visibility = np.asarray(
+            visibility
+        ).astype(bool)
 
         jerk_visibility = (
             visibility[:-3]
@@ -582,7 +848,7 @@ def compute_jerk_jitter(
 
 
 # ============================================================
-# 6. Frame-to-frame displacement
+# 7. Frame-to-frame displacement
 # ============================================================
 
 def compute_mean_frame_displacement(
@@ -592,7 +858,20 @@ def compute_mean_frame_displacement(
     """
     Compute mean joint displacement between consecutive frames.
 
-    Unlike physical velocity, this does not multiply by FPS.
+    Unlike physical velocity, this function does not multiply by
+    the video FPS.
+
+    Parameters
+    ----------
+    sequence:
+        Shape [T, J, C].
+    visibility:
+        Optional shape [T, J].
+
+    Returns
+    -------
+    float
+        Mean frame-to-frame displacement.
     """
     sequence = _as_float_array(sequence)
 
@@ -612,7 +891,9 @@ def compute_mean_frame_displacement(
     valid = np.isfinite(magnitude)
 
     if visibility is not None:
-        visibility = np.asarray(visibility)
+        visibility = np.asarray(
+            visibility
+        ).astype(bool)
 
         valid &= (
             visibility[:-1]
@@ -628,13 +909,14 @@ def compute_mean_frame_displacement(
 
 
 # ============================================================
-# 7. Metric summary
+# 8. Metric summary
 # ============================================================
 
 def summarize_pose_metrics(
     prediction: np.ndarray,
     target: np.ndarray,
     normalization_length: Optional[np.ndarray] = None,
+    head_length: Optional[np.ndarray] = None,
     visibility: Optional[np.ndarray] = None,
     pck_thresholds: Sequence[float] = (
         0.05,
@@ -642,26 +924,87 @@ def summarize_pose_metrics(
         0.20,
         0.50,
     ),
+    pckh_thresholds: Sequence[float] = (
+        0.50,
+    ),
 ) -> dict:
     """
-    Compute a compact dictionary of pose metrics.
+    Compute a compact dictionary of pose-estimation metrics.
+
+    Parameters
+    ----------
+    prediction:
+        Predicted keypoint coordinates.
+    target:
+        Ground-truth keypoint coordinates.
+    normalization_length:
+        Normalization scale used for generic PCK.
+        Set this to None when generic PCK is not required.
+    head_length:
+        Head normalization scale used for PCKh.
+        Set this to None when PCKh is not required.
+    visibility:
+        Optional joint visibility mask.
+    pck_thresholds:
+        Thresholds used for generic PCK.
+    pckh_thresholds:
+        Thresholds used for PCKh.
+
+    Returns
+    -------
+    dict
+        Metric names and values.
+
+    Example output
+    --------------
+    {
+        "mpjpe": 4.25,
+        "pck_0.10": 93.50,
+        "pckh_0.50": 88.30,
+    }
     """
     metrics = {
         "mpjpe": compute_mpjpe(
-            prediction,
-            target,
+            prediction=prediction,
+            target=target,
             visibility=visibility,
         )
     }
 
     if normalization_length is not None:
         for threshold in pck_thresholds:
-            metric_name = f"pck_{threshold:.2f}"
+            if threshold <= 0:
+                raise ValueError(
+                    "All PCK thresholds must be positive"
+                )
+
+            metric_name = (
+                f"pck_{threshold:.2f}"
+            )
 
             metrics[metric_name] = compute_pck(
                 prediction=prediction,
                 target=target,
                 normalization_length=normalization_length,
+                threshold=threshold,
+                visibility=visibility,
+            )
+
+    if head_length is not None:
+        for threshold in pckh_thresholds:
+            if threshold <= 0:
+                raise ValueError(
+                    "All PCKh thresholds must be positive"
+                )
+
+            metric_name = (
+                f"pckh_{threshold:.2f}"
+            )
+
+            metrics[metric_name] = compute_pckh(
+                prediction=prediction,
+                target=target,
+                head_length=head_length,
                 threshold=threshold,
                 visibility=visibility,
             )

@@ -1,3 +1,5 @@
+# Scripts/NTU_RGBD/datasets/ntu_frame_dataset.py
+
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -36,7 +38,154 @@ NTU_EXTRACTED_FRAMES_DIR = (
 
 
 # ============================================================
-# 2. Heatmap generation
+# 2. NTU joint indices
+# ============================================================
+
+# NTU RGB+D Kinect V2 joint ordering:
+# 0: SpineBase
+# 1: SpineMid
+# 2: Neck
+# 3: Head
+
+NTU_NECK_INDEX = 2
+NTU_HEAD_INDEX = 3
+
+HEAD_LENGTH_EPSILON = 1e-6
+MPII_HEAD_SCALE_FACTOR = 1.5
+
+
+# ============================================================
+# 3. Head-length calculation
+# ============================================================
+
+def compute_head_length(
+    keypoints: np.ndarray,
+    visibility: np.ndarray,
+    head_index: int = NTU_HEAD_INDEX,
+    neck_index: int = NTU_NECK_INDEX,
+    epsilon: float = HEAD_LENGTH_EPSILON,
+) -> np.float32:
+    """
+    Compute the 2D distance between the NTU head and neck joints.
+
+    The returned length must be calculated in the same coordinate
+    system as the prediction and target keypoints.
+
+    Parameters
+    ----------
+    keypoints:
+        Shape [J, 2].
+
+    visibility:
+        Shape [J].
+
+    head_index:
+        Index of the head joint.
+
+    neck_index:
+        Index of the neck joint.
+
+    epsilon:
+        Minimum valid head length.
+
+    Returns
+    -------
+    np.float32
+        Head-to-neck distance. Returns NaN when the required joints
+        are unavailable or invalid.
+    """
+    keypoints = np.asarray(
+        keypoints,
+        dtype=np.float32,
+    )
+
+    visibility = np.asarray(
+        visibility,
+    ).astype(bool)
+
+    if keypoints.ndim != 2 or keypoints.shape[1] != 2:
+        raise ValueError(
+            "keypoints must have shape [J, 2]"
+        )
+
+    if visibility.shape != (keypoints.shape[0],):
+        raise ValueError(
+            "visibility must have shape [J]"
+        )
+
+    num_joints = keypoints.shape[0]
+
+    if not (
+        0 <= head_index < num_joints
+    ):
+        raise IndexError(
+            f"head_index {head_index} is outside "
+            f"the valid range [0, {num_joints - 1}]"
+        )
+
+    if not (
+        0 <= neck_index < num_joints
+    ):
+        raise IndexError(
+            f"neck_index {neck_index} is outside "
+            f"the valid range [0, {num_joints - 1}]"
+        )
+
+    if not visibility[head_index]:
+        return np.float32(
+            np.nan
+        )
+
+    if not visibility[neck_index]:
+        return np.float32(
+            np.nan
+        )
+
+    head_point = keypoints[
+        head_index
+    ]
+
+    neck_point = keypoints[
+        neck_index
+    ]
+
+    if not np.isfinite(
+        head_point
+    ).all():
+        return np.float32(
+            np.nan
+        )
+
+    if not np.isfinite(
+        neck_point
+    ).all():
+        return np.float32(
+            np.nan
+        )
+
+    head_length = float(
+    np.linalg.norm(
+        head_point - neck_point
+    )
+    )
+
+    head_length *= MPII_HEAD_SCALE_FACTOR
+
+    if (
+        not np.isfinite(head_length)
+        or head_length <= epsilon
+    ):
+        return np.float32(
+            np.nan
+        )
+
+    return np.float32(
+        head_length
+    )
+
+
+# ============================================================
+# 4. Heatmap generation
 # ============================================================
 
 def generate_gaussian_heatmaps(
@@ -74,8 +223,15 @@ def generate_gaussian_heatmaps(
         if not visibility[joint_index]:
             continue
 
-        x = keypoints[joint_index, 0] * scale
-        y = keypoints[joint_index, 1] * scale
+        x = keypoints[
+            joint_index,
+            0,
+        ] * scale
+
+        y = keypoints[
+            joint_index,
+            1,
+        ] * scale
 
         if not (
             np.isfinite(x)
@@ -83,8 +239,13 @@ def generate_gaussian_heatmaps(
         ):
             continue
 
-        center_x = int(round(x))
-        center_y = int(round(y))
+        center_x = int(
+            round(x)
+        )
+
+        center_y = int(
+            round(y)
+        )
 
         if not (
             0 <= center_x < heatmap_size
@@ -148,7 +309,7 @@ def generate_gaussian_heatmaps(
 
 
 # ============================================================
-# 3. Dataset
+# 5. Dataset
 # ============================================================
 
 class NTUFrameDataset(Dataset):
@@ -167,6 +328,8 @@ class NTUFrameDataset(Dataset):
         person_crop: bool = True,
         bbox_expansion: float = 0.25,
         validate_pose_sequences: bool = True,
+        head_index: int = NTU_HEAD_INDEX,
+        neck_index: int = NTU_NECK_INDEX,
     ):
         super().__init__()
 
@@ -179,16 +342,19 @@ class NTUFrameDataset(Dataset):
         self.heatmap_size = heatmap_size
         self.sigma = sigma
         self.frame_stride = frame_stride
+
         self.single_person_only = (
             single_person_only
         )
 
         self.max_samples = max_samples
+
         self.skeleton_cache_size = (
             skeleton_cache_size
         )
 
         self.person_crop = person_crop
+
         self.bbox_expansion = (
             bbox_expansion
         )
@@ -196,6 +362,24 @@ class NTUFrameDataset(Dataset):
         self.validate_pose_sequences = (
             validate_pose_sequences
         )
+
+        self.head_index = int(
+            head_index
+        )
+
+        self.neck_index = int(
+            neck_index
+        )
+
+        if self.head_index < 0:
+            raise ValueError(
+                "head_index must be non-negative"
+            )
+
+        if self.neck_index < 0:
+            raise ValueError(
+                "neck_index must be non-negative"
+            )
 
         if self.bbox_expansion < 0:
             raise ValueError(
@@ -236,8 +420,6 @@ class NTUFrameDataset(Dataset):
                 "skeleton_cache_size must be positive"
             )
 
-        # Skeleton cache is created before metadata validation.
-        # Validated pose sequences can therefore be reused later.
         self._skeleton_cache = OrderedDict()
 
         (
@@ -300,6 +482,21 @@ class NTUFrameDataset(Dataset):
             f"{self.validate_pose_sequences}"
         )
 
+        print(
+            f"Head joint index:    "
+            f"{self.head_index}"
+        )
+
+        print(
+            f"Neck joint index:    "
+            f"{self.neck_index}"
+        )
+
+        print(
+            "Head scale:          "
+            "2D head-to-neck distance"
+        )
+
         if self.skipped_samples:
             print()
             print("Skipped sample examples:")
@@ -321,7 +518,7 @@ class NTUFrameDataset(Dataset):
         print()
 
     # ========================================================
-    # 4. Metadata loading and validation
+    # 6. Metadata loading and validation
     # ========================================================
 
     @staticmethod
@@ -414,9 +611,6 @@ class NTUFrameDataset(Dataset):
         """
         Strictly verify that the skeleton file contains a
         primary pose sequence that the Dataset can use.
-
-        Validation is performed once per video during Dataset
-        initialisation, not once per frame.
         """
         if not skeleton_path.exists():
             return (
@@ -636,7 +830,7 @@ class NTUFrameDataset(Dataset):
         )
 
     # ========================================================
-    # 5. Frame index
+    # 7. Frame index
     # ========================================================
 
     def _build_frame_index(
@@ -647,6 +841,7 @@ class NTUFrameDataset(Dataset):
         ] = []
 
         valid_samples: list[dict] = []
+
         skipped_missing_frames: list[
             dict[str, str]
         ] = []
@@ -688,7 +883,6 @@ class NTUFrameDataset(Dataset):
                 )
                 continue
 
-            # Verify that the sample frame directory exists.
             sample_frame_dir = (
                 self.extracted_frames_dir
                 / sample_id
@@ -725,8 +919,6 @@ class NTUFrameDataset(Dataset):
                     )
                 )
 
-                # Missing individual frames are skipped.
-                # They no longer terminate training.
                 if not frame_path.exists():
                     continue
 
@@ -765,7 +957,7 @@ class NTUFrameDataset(Dataset):
         return frame_index
 
     # ========================================================
-    # 6. Skeleton loading and cache
+    # 8. Skeleton loading and cache
     # ========================================================
 
     def _load_pose_sequence(
@@ -812,7 +1004,7 @@ class NTUFrameDataset(Dataset):
         return pose_sequence
 
     # ========================================================
-    # 7. Frame path
+    # 9. Frame path
     # ========================================================
 
     def _get_frame_path(
@@ -827,7 +1019,7 @@ class NTUFrameDataset(Dataset):
         )
 
     # ========================================================
-    # 8. Dataset interface
+    # 10. Dataset interface
     # ========================================================
 
     def __len__(
@@ -862,8 +1054,6 @@ class NTUFrameDataset(Dataset):
             frame_number=frame_number,
         )
 
-        # This should not normally happen because missing
-        # frames were removed in _build_frame_index().
         if not frame_path.exists():
             raise FileNotFoundError(
                 f"Extracted frame not found: "
@@ -948,6 +1138,7 @@ class NTUFrameDataset(Dataset):
             image = crop_result.image
             keypoints = crop_result.keypoints
             visibility = crop_result.visibility
+
             person_bbox = (
                 crop_result.bbox_xyxy
             )
@@ -1037,6 +1228,26 @@ class NTUFrameDataset(Dataset):
                 ).float()
             )
 
+        # Calculate head length after all crop and resize
+        # operations. This keeps it in the same coordinate system
+        # as keypoints_tensor and decoded predictions.
+        head_length = compute_head_length(
+            keypoints=(
+                keypoints_tensor
+                .detach()
+                .cpu()
+                .numpy()
+            ),
+            visibility=(
+                visibility_tensor
+                .detach()
+                .cpu()
+                .numpy()
+            ),
+            head_index=self.head_index,
+            neck_index=self.neck_index,
+        )
+
         heatmaps = generate_gaussian_heatmaps(
             keypoints=(
                 keypoints_tensor
@@ -1065,6 +1276,11 @@ class NTUFrameDataset(Dataset):
             "keypoints": keypoints_tensor,
 
             "visibility": visibility_tensor,
+
+            "head_length": torch.tensor(
+                head_length,
+                dtype=torch.float32,
+            ),
 
             "sample_id": sample_id,
 
