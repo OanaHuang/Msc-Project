@@ -55,7 +55,6 @@ from Scripts.NTU_RGBD.models.spikeyolo_style_ilif_heatmap import (
 # ============================================================
 
 MODEL_VERSION = "21"
-MODEL_NAME = "SpikeYOLO-style I-LIF Heatmap"
 
 IMAGE_SIZE = 224
 HEATMAP_SIZE = 56
@@ -79,34 +78,50 @@ MAX_SPIKES = 4
 
 # Model 21 was trained using skeleton-guided person crops.
 PERSON_CROP = True
+
 BBOX_EXPANSION = 0.25
 
 # Raw heatmap peak threshold.
 CONFIDENCE_THRESHOLD = 0.02
 
-# 1 means every frame is processed.
+# 1 means every source frame is processed.
 FRAME_STRIDE = 1
 
-# None retains the source video's effective FPS.
+# None keeps the source video's effective FPS.
 OUTPUT_FPS = None
 
-# None lets get_device choose the device automatically.
+# None lets get_device select the device automatically.
 DEVICE_NAME = None
 
-# Skip an existing non-empty MP4 file.
+# Skip an existing non-empty MP4.
 SKIP_EXISTING_VIDEOS = True
 
-# Save coordinates, confidence values, GT and bounding boxes.
+# Save prediction coordinates, confidence, GT and bbox data.
 SAVE_PREDICTION_NPZ = True
 
 # Use 1 or 3 for a quick test.
-# Use None to process all single-person test videos.
+# Use None to process every single-person test video.
 MAX_TEST_VIDEOS = 1
 
 
 # ============================================================
 # 6. Paths
 # ============================================================
+
+TEST_CSV = (
+    NTU_METADATA_DIR
+    / "test_split.csv"
+)
+
+RGB_VIDEO_DIR = (
+    NTU_RGBD_DATASET_DIR
+    / "rgb_videos"
+)
+
+SKELETON_DIR = (
+    NTU_RGBD_DATASET_DIR
+    / "skeletons"
+)
 
 MODEL_DIR = (
     NTU_RGBD_OUTPUT_DIR
@@ -131,32 +146,28 @@ OUTPUT_DIR = (
 CONFIG = VideoGenerationConfig(
     model_version=MODEL_VERSION,
 
-    test_csv=(
-        NTU_METADATA_DIR
-        / "test_split.csv"
-    ),
+    test_csv=TEST_CSV,
 
-    rgb_video_dir=(
-        NTU_RGBD_DATASET_DIR
-        / "rgb_videos"
-    ),
+    rgb_video_dir=RGB_VIDEO_DIR,
 
-    skeleton_dir=(
-        NTU_RGBD_DATASET_DIR
-        / "skeletons"
-    ),
+    skeleton_dir=SKELETON_DIR,
 
     output_dir=OUTPUT_DIR,
 
     image_size=IMAGE_SIZE,
+
     heatmap_size=HEATMAP_SIZE,
+
     num_joints=NUM_JOINTS,
 
     person_crop=PERSON_CROP,
+
     bbox_expansion=BBOX_EXPANSION,
+
     confidence_threshold=CONFIDENCE_THRESHOLD,
 
     frame_stride=FRAME_STRIDE,
+
     output_fps=OUTPUT_FPS,
 
     skip_existing_videos=(
@@ -179,16 +190,10 @@ CONFIG = VideoGenerationConfig(
     ),
 
     num_steps=NUM_STEPS,
-    beta=BETA,
-    threshold=THRESHOLD,
 
-    extra_npz_metadata={
-        "model_name": MODEL_NAME,
-        "max_spikes": MAX_SPIKES,
-        "neuron_type": "integer_lif",
-        "integer_spike_min": 0,
-        "integer_spike_max": MAX_SPIKES,
-    },
+    beta=BETA,
+
+    threshold=THRESHOLD,
 )
 
 
@@ -200,26 +205,13 @@ def extract_state_dict(
     checkpoint: object,
 ) -> dict[str, torch.Tensor]:
     """
-    Extract a model state dictionary from common checkpoint formats.
+    Extract a state dictionary from common checkpoint formats.
 
     Supported formats:
-        {
-            "model_state_dict": ...
-        }
-
-        {
-            "state_dict": ...
-        }
-
-        {
-            "model": ...
-        }
-
-        Direct state dictionary:
-        {
-            "layer.weight": Tensor,
-            ...
-        }
+        checkpoint["model_state_dict"]
+        checkpoint["state_dict"]
+        checkpoint["model"]
+        direct state dictionary
     """
     if isinstance(
         checkpoint,
@@ -259,24 +251,29 @@ def remove_module_prefix(
     state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     """
-    Remove the 'module.' prefix introduced by DataParallel
+    Remove the 'module.' prefix added by DataParallel
     or DistributedDataParallel.
     """
-    cleaned_state_dict: dict[
+    cleaned: dict[
         str,
         torch.Tensor,
     ] = {}
 
     for key, value in state_dict.items():
-        cleaned_key = key.removeprefix(
-            "module."
-        )
+        cleaned_key = key
 
-        cleaned_state_dict[
+        if cleaned_key.startswith(
+            "module."
+        ):
+            cleaned_key = cleaned_key[
+                len("module.") :
+            ]
+
+        cleaned[
             cleaned_key
         ] = value
 
-    return cleaned_state_dict
+    return cleaned
 
 
 # ============================================================
@@ -287,10 +284,10 @@ def load_model(
     device: torch.device,
 ) -> torch.nn.Module:
     """
-    Construct Model 21 and load its trained checkpoint.
+    Build Model 21 and load its trained checkpoint.
 
-    The shared video-generation module moves the returned model
-    to the selected device and switches it to evaluation mode.
+    Moving the model to the device and switching it to eval mode
+    are handled by run_video_generation().
     """
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
@@ -331,15 +328,14 @@ def load_model(
 
 
 # ============================================================
-# 10. Transform creation
+# 10. Transform builder
 # ============================================================
 
 def build_transform(
     image_size: int,
 ):
     """
-    Build the same evaluation transform used by the
-    NTU RGB+D heatmap models.
+    Build the standard NTU RGB+D evaluation transform.
     """
     return build_eval_transform(
         image_size=image_size,
@@ -347,14 +343,14 @@ def build_transform(
 
 
 # ============================================================
-# 11. Configuration display
+# 11. Model information
 # ============================================================
 
-def print_model_configuration() -> None:
+def print_model_information() -> None:
     print()
     print("=" * 72)
     print(
-        "Model 21: SpikeYOLO-style I-LIF "
+        "NTU RGB+D SpikeYOLO-style I-LIF "
         "heatmap video generation"
     )
     print("=" * 72)
@@ -365,12 +361,7 @@ def print_model_configuration() -> None:
     )
 
     print(
-        f"Model name:          "
-        f"{MODEL_NAME}"
-    )
-
-    print(
-        f"Model checkpoint:    "
+        f"Model path:          "
         f"{MODEL_PATH}"
     )
 
@@ -381,12 +372,12 @@ def print_model_configuration() -> None:
 
     print(
         f"Image size:          "
-        f"{IMAGE_SIZE} x {IMAGE_SIZE}"
+        f"{IMAGE_SIZE}"
     )
 
     print(
         f"Heatmap size:        "
-        f"{HEATMAP_SIZE} x {HEATMAP_SIZE}"
+        f"{HEATMAP_SIZE}"
     )
 
     print(
@@ -410,7 +401,7 @@ def print_model_configuration() -> None:
     )
 
     print(
-        f"Integer spike range: "
+        f"Integer range:       "
         f"0..{MAX_SPIKES}"
     )
 
@@ -452,7 +443,7 @@ def print_model_configuration() -> None:
 # ============================================================
 
 def main() -> None:
-    print_model_configuration()
+    print_model_information()
 
     device = get_device(
         preferred=DEVICE_NAME,
